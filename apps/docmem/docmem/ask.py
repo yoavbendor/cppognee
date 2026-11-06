@@ -96,39 +96,91 @@ async def link_neighbours(graph, passage_ids: list[str]):
     return via, degree
 
 
+async def hits_for(ids, distance: dict):
+    """Hit dicts (as retrieve makes them) for passage ids, in the given order."""
+    graph, _ = await store.engines()
+    nodes = {nd["id"]: store.node_props(nd) for nd in await graph.get_nodes(list(ids))}
+    out = []
+    for pid in ids:
+        nd = nodes.get(pid)
+        if nd is None:
+            continue
+        out.append({"distance": distance.get(pid), **{k_: nd[k_] for k_ in (
+            "id", "path", "offset", "length", "line", "end_line", "sha256", "section_offset", "section_length")},
+            "extractor": nd.get("extractor", ""), "doc_sha256": nd.get("doc_sha256", ""), "uri": nd["name"]})
+    return out
+
+
+async def best_of(question: str, cands, n: int):
+    """The n candidate passages nearest the question, by their stored vectors (no re-embedding)."""
+    import numpy as np
+
+    _, vector = await store.engines()
+    rows = await vector.retrieve(store.PASSAGES, list(cands), include_vector=True)
+    q = np.asarray((await vector.embedding_engine.embed_text([question]))[0], dtype=np.float32)
+    q /= np.linalg.norm(q) or 1
+    scored = sorted((1 - float(q @ (v := np.asarray(r.payload["vector"], dtype=np.float32)) /
+                               (np.linalg.norm(v) or 1)), str(r.id)) for r in rows)[:n]
+    return await hits_for([pid for _, pid in scored], {pid: round(d, 4) for d, pid in scored})
+
+
+async def hybrid(question: str, k: int, db):
+    """Vector and keyword (BM25) results fused by reciprocal rank (1 / (60 + rank) summed), top k."""
+    from .keywords import KeywordIndex
+
+    vec, timing = await retrieve(question, 3 * k)
+    t = time.time()
+    kw = KeywordIndex(db).search(question, 3 * k)
+    timing["keyword_ms"] = round((time.time() - t) * 1000, 1)
+    score = {}
+    for i, h in enumerate(vec, 1):
+        score[h["id"]] = score.get(h["id"], 0) + 1 / (60 + i)
+    for i, (pid, _) in enumerate(kw, 1):
+        score[pid] = score.get(pid, 0) + 1 / (60 + i)
+    top = sorted(score, key=lambda p: -score[p])[:k]
+    by_id = {h["id"]: h for h in vec}
+    missing = [p for p in top if p not in by_id]
+    by_id.update({h["id"]: h for h in await hits_for(missing, {})})
+    out = [by_id[p] for p in top if p in by_id]
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, timing
+
+
+async def expand_terms(question: str, hits, n: int, db, terms: int = 8):
+    """Add up to n passages of OTHER documents that share the hits' rarest terms (BM25 over those
+    terms), ranked by the question's similarity to their stored vectors; no LLM."""
+    from .keywords import KeywordIndex
+
+    kw = KeywordIndex(db)
+    rare = kw.rare_terms([h["id"] for h in hits], terms)
+    if not rare:
+        return hits, []
+    docs = {h["uri"] for h in hits}
+    found = kw.search(" ".join(rare), 10 * n)
+    cands = {pid: rare for pid, _ in found if pid not in {h["id"] for h in hits}}
+    added = [h for h in await best_of(question, cands, 3 * n) if h["uri"] not in docs][:n]
+    for h in added:
+        h["via"] = ["terms: " + ", ".join(rare[:4])]
+    out = hits + added
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, [h["via"] for h in added]
+
+
 async def expand_links(question: str, hits, n: int, max_degree: int):
     """Add up to n passages reached through links from the hits, ranked by the question's similarity to
     their stored vectors. Targets linked from more than max_degree passages (e.g. a country) are too
     common to say anything and are not followed."""
-    import numpy as np
-
-    graph, vector = await store.engines()
+    graph, _ = await store.engines()
     via, degree = await link_neighbours(graph, [h["id"] for h in hits])
     common = {t for t, d in degree.items() if d > max_degree}
     cands = {pid: ts for pid, ts in via.items() if any(t not in common for t in ts)}
     if not cands:
         return hits, []
-    rows = await vector.retrieve(store.PASSAGES, list(cands), include_vector=True)
-    q = np.asarray((await vector.embedding_engine.embed_text([question]))[0], dtype=np.float32)
-    q /= np.linalg.norm(q) or 1
-    scored = []
-    for r in rows:
-        v = np.asarray(r.payload["vector"], dtype=np.float32)
-        scored.append((1 - float(q @ v / (np.linalg.norm(v) or 1)), str(r.id)))
-    scored.sort()
-    chosen = [pid for _, pid in scored[:n]]
-    nodes = {nd["id"]: store.node_props(nd) for nd in await graph.get_nodes(chosen)}
-    dist = {pid: d for d, pid in scored}
-    added = []
-    for pid in chosen:
-        nd = nodes.get(pid)
-        if nd is None:
-            continue
-        h = {"distance": round(dist[pid], 4), **{k_: nd[k_] for k_ in (
-            "id", "path", "offset", "length", "line", "end_line", "sha256", "section_offset", "section_length")},
-            "extractor": nd.get("extractor", ""), "doc_sha256": nd.get("doc_sha256", ""), "uri": nd["name"],
-            "via": [t for t in cands[pid] if t not in common]}
-        added.append(h)
+    added = await best_of(question, cands, n)
+    for h in added:
+        h["via"] = [t for t in cands[h["id"]] if t not in common]
     out = hits + added
     for i, h in enumerate(out, 1):
         h["rank"] = i
@@ -256,11 +308,20 @@ async def follow(queries: list[str], hits, a):
 
 async def ask_one(question: str, a, chat):
     before = chat.usage["calls"] if chat else 0
-    hits, timing = await retrieve(question, a.k, a.rerank or a.k)
+    if a.keywords:
+        hits, timing = await hybrid(question, a.rerank or a.k, a.db)
+    else:
+        hits, timing = await retrieve(question, a.k, a.rerank or a.k)
     linked = []
+    if a.terms:
+        t = time.time()
+        hits, by_terms = await expand_terms(question, hits, a.terms, a.db)
+        linked += by_terms
+        timing["terms_ms"] = round((time.time() - t) * 1000, 1)
     if a.links:
         t = time.time()
-        hits, linked = await expand_links(question, hits, a.links, a.link_max_degree)
+        hits, by_links = await expand_links(question, hits, a.links, a.link_max_degree)
+        linked += by_links
         timing["links_ms"] = round((time.time() - t) * 1000, 1)
     hits = read_hits(hits, a.context, a.max_bytes)
     t = time.time()
@@ -303,6 +364,10 @@ def add_common(ap):
                     help="give the model each hit's passage, or its whole enclosing section")
     ap.add_argument("--max-bytes", type=int, default=6000, help="cut a section read at this many bytes")
     ap.add_argument("--no-answer", action="store_true", help="retrieval only; no chat model needed")
+    ap.add_argument("--keywords", action="store_true",
+                    help="hybrid retrieval: fuse vector and keyword (BM25) results by reciprocal rank")
+    ap.add_argument("--terms", type=int, default=0, metavar="N",
+                    help="add up to N passages of other documents sharing the hits' rarest terms; no LLM")
     ap.add_argument("--links", type=int, default=0, metavar="N",
                     help="add up to N passages one link away from the hits (shared link targets, the "
                          "linked document itself), ranked by similarity; no LLM; 0 = off")
@@ -351,7 +416,8 @@ def main(argv=None):
         if h.get("via"):
             flag += f"  [linked via {', '.join(h['via'][:3])}]"
         link = f"{store.uri_path(h['uri'])}#L{h['line']}" if h["uri"].startswith("file:") else h["uri"]
-        print(f"[{i}] {h['distance']:.3f}  {label(h)}{flag}\n     {link}")
+        dist = f"{h['distance']:.3f}" if h.get('distance') is not None else "  kw "
+        print(f"[{i}] {dist}  {label(h)}{flag}\n     {link}")
     print(f"\n{json.dumps(r['timing'])} calls={r['calls']}", file=sys.stderr)
 
 
