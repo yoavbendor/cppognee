@@ -544,8 +544,13 @@ class LanceDBAdapter(VectorDBInterface):
             )
         return existing_belongs_to_set
 
-    async def create_data_points(self, collection_name: str, data_points: list[DataPoint]):
-        """Upsert DataPoints into `collection_name`, merging belongs_to_set with any prior rows."""
+    async def create_data_points(
+        self, collection_name: str, data_points: list[DataPoint], store_text: bool = True
+    ):
+        """Upsert DataPoints into `collection_name`, merging belongs_to_set with any prior rows.
+
+        With ``store_text=False`` the points are embedded from their ``text`` and stored with
+        an empty one (see ``index_data_points``)."""
         payload_schema = type(data_points[0])
         self._mark_written(collection_name)
 
@@ -560,6 +565,8 @@ class LanceDBAdapter(VectorDBInterface):
         data_vectors = await self.embed_data(
             [DataPoint.get_embeddable_data(data_point) for data_point in data_points]
         )
+        if not store_text:
+            data_points = [dp.model_copy(update={"text": ""}) for dp in data_points]
 
         vector_size = self.embedding_engine.get_vector_size()
 
@@ -1764,6 +1771,9 @@ class LanceDBAdapter(VectorDBInterface):
                 )
                 for data_point in data_points
             ],
+            # A DataPoint type whose text lives elsewhere (a file the caller reads by offset)
+            # sets metadata["store_index_text"] = False: its rows keep the vector, not the text.
+            store_text=data_points[0].metadata.get("store_index_text", True),
         )
 
     async def prune(self):
