@@ -83,10 +83,43 @@ def prompt(title: str, group, passages) -> str:
     return "\n".join(out)
 
 
+def repair_json(text: str):
+    """The longest complete prefix of a JSON object cut off mid-reply (max_tokens), closed: the entries
+    written in full are kept, the one being written is dropped. None if nothing parses."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    stack, in_str, esc, cuts = [], False, False, []
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            esc = (c == "\\") and not esc
+            if c == '"' and not esc:
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c in "{[":
+            stack.append("}" if c == "{" else "]")
+        elif c in "}]":
+            if stack:
+                stack.pop()
+            cuts.append((i + 1, "".join(reversed(stack))))
+            if not stack:
+                break
+    for end, closers in reversed(cuts):
+        try:
+            return json.loads(text[start:end] + closers)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 class Budget:
     def __init__(self, max_calls=None, max_tokens=None):
         self.max_calls, self.max_tokens = max_calls, max_tokens
         self.calls = self.prompt_tokens = self.completion_tokens = self.failed = self.in_flight = 0
+        self.salvaged = 0
 
     def spent(self) -> bool:
         """Whether another call would go over: calls in flight count against the call budget."""
@@ -95,7 +128,8 @@ class Budget:
 
     def as_dict(self):
         return {"calls": self.calls, "prompt_tokens": self.prompt_tokens,
-                "completion_tokens": self.completion_tokens, "failed_groups": self.failed}
+                "completion_tokens": self.completion_tokens, "failed_groups": self.failed,
+                "salvaged_replies": self.salvaged}
 
 
 class Enricher:
@@ -129,9 +163,16 @@ class Enricher:
             self.budget.completion_tokens += r.usage.completion_tokens or 0
         text = r.choices[0].message.content or ""
         m = re.search(r"\{.*\}", text, re.S)
-        if not m:
-            raise ValueError(f"no JSON in reply: {text[:120]!r}")
-        return json.loads(m.group(0))
+        try:
+            return json.loads(m.group(0)) if m else None
+        except json.JSONDecodeError:
+            pass
+        # cut off at max_tokens (or a stray character): keep the entries written in full
+        obj = repair_json(text)
+        if obj is None:
+            raise ValueError(f"no JSON in reply ({r.choices[0].finish_reason}): {text[:120]!r}")
+        self.budget.salvaged += 1
+        return obj
 
     async def group(self, title, group, passages):
         """(record, None) or (None, reason)."""
@@ -140,8 +181,12 @@ class Enricher:
                 if self.budget.spent():
                     return None, "budget"
                 try:
-                    return parse(await self.call(prompt(title, group, passages)), group), None
-                except Exception as e:  # bad JSON or a server error: one retry, then a gap
+                    obj = await self.call(prompt(title, group, passages))
+                    return parse(obj or {}, group), None
+                except ValueError as e:  # unusable reply: at temperature 0 a retry repeats it
+                    reason = f"{type(e).__name__}: {e}"[:200]
+                    break
+                except Exception as e:  # a server or network error: one retry, then a gap
                     reason = f"{type(e).__name__}: {e}"[:200]
             self.budget.failed += 1
             return None, reason

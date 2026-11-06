@@ -63,10 +63,10 @@ def read_hits(hits, context: str, max_bytes: int):
     out = []
     for h in hits:
         if context == "section":
-            span = (h["uri"], h["section_offset"])
-            if span in seen:
+            sec = (h["uri"], h["section_offset"])
+            if sec in seen:
                 continue
-            seen.add(span)
+            seen.add(sec)
             text, status = span(h, h["section_offset"], min(h["section_length"], max_bytes))
             # the section's bytes are not hashed; the passage's are, so check the passage
             _, status = span(h, h["offset"], h["length"], h["sha256"])
