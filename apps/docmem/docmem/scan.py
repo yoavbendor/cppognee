@@ -4,7 +4,9 @@ The stream (protocol 1), per document:
   {"type": "doc", "uri", "sha256", "size", "mtime", "title"}
   {"type": "section", "uri", "path": [...], "level", "offset", "length", "line"}      (one per heading)
   {"type": "passage", "uri", "path": [...], "offset", "length", "line", "end_line", "sha256", "text"}
-  {"type": "end", "uri", "sections", "passages"}
+  {"type": "link", "uri", "offset", "length", "anchor", "target", "kind", "fragment"}              (one per link,
+                                                                                    after the passages)
+  {"type": "end", "uri", "sections", "passages", "links"}
 and once at the end: {"type": "scan_end", "roots": [...], "uris": [...]}.
 
 Offsets and lengths are in bytes of the file as it was scanned; "sha256" of a passage hashes exactly
@@ -23,6 +25,7 @@ import sys
 from pathlib import Path
 
 from . import PROTOCOL
+from .links import markdown_links
 
 HEADING = re.compile(rb"^(#{1,6})[ \t]+(.+?)[ \t#]*$")
 FENCE = re.compile(rb"^[ \t]{0,3}(```|~~~)")
@@ -114,18 +117,26 @@ def line_at(data: bytes, offset: int, base_offset: int, base_line: int) -> int:
     return base_line + data.count(b"\n", base_offset, offset)
 
 
-def scan_file(path: Path, target_words: int, max_words: int):
+def scan_file(path: Path, target_words: int, max_words: int, id_patterns=()):
     data = path.read_bytes()
     doc = {"uri": path.resolve().as_uri(), "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
            "mtime": path.stat().st_mtime, "title": None}
-    yield from scan_bytes(data, doc, path.stem, target_words, max_words)
+    yield from scan_bytes(data, doc, path.stem, target_words, max_words, id_patterns=id_patterns)
 
 
-def scan_bytes(data: bytes, doc: dict, fallback_title: str, target_words: int, max_words: int):
+def scan_bytes(data: bytes, doc: dict, fallback_title: str, target_words: int, max_words: int,
+               links=None, id_patterns=()):
     """Cut markdown ``data`` into the doc's records. ``doc`` holds the doc record's fields (uri, sha256,
     size, mtime, and for a derived text "format", "extractor", ...); title None means the first "# "
-    heading, else fallback_title. Offsets are into ``data``."""
+    heading, else fallback_title. Offsets are into ``data``.
+
+    ``links`` are the document's links (docmem.links), given by a derived text's extractor. Without them a
+    markdown document (no "extractor") has its links read from ``data`` with ``id_patterns``; a derived text
+    without them has none."""
     uri = doc["uri"]
+    if links is None:
+        links = [] if "extractor" in doc else markdown_links(data, uri, id_patterns)
+    links = sorted(links, key=lambda r: r["offset"])
     events = list(blocks(data))
     title = doc.get("title") or next((t for kind, lvl, t, *_ in events if kind == "heading" and lvl == 1),
                                      fallback_title)
@@ -169,7 +180,10 @@ def scan_bytes(data: bytes, doc: dict, fallback_title: str, target_words: int, m
         else:
             group.append((s, e, ln))
     yield from flush()
-    yield {"type": "end", "uri": uri, "sections": n_sections, "passages": n_passages}
+    for r in links:
+        yield {"type": "link", "uri": uri, "offset": r["offset"], "length": r["length"], "anchor": r["anchor"],
+               "target": r["target"], "kind": r["kind"], "fragment": r["fragment"]}
+    yield {"type": "end", "uri": uri, "sections": n_sections, "passages": n_passages, "links": len(links)}
 
 
 def iter_files(roots):
@@ -190,12 +204,19 @@ def main(argv=None):
     ap.add_argument("roots", nargs="+", help="markdown files or directories (scanned recursively)")
     ap.add_argument("--target-words", type=int, default=180, help="merge blocks up to this many words")
     ap.add_argument("--max-words", type=int, default=320, help="split blocks longer than this")
+    ap.add_argument("--id-pattern", action="append", default=[], metavar="REGEX",
+                    help="every match is an id link (repeatable), e.g. '\\b[A-Z]{2,8}-\\d{1,6}\\b'")
     a = ap.parse_args(argv)
+    for pattern in a.id_pattern:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            ap.error(f"--id-pattern {pattern!r}: {e}")
     out = sys.stdout
     uris = []
     out.write(json.dumps({"type": "scan_start", "protocol": PROTOCOL}) + "\n")
     for f in iter_files(a.roots):
-        for rec in scan_file(f, a.target_words, a.max_words):
+        for rec in scan_file(f, a.target_words, a.max_words, a.id_pattern):
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
         uris.append(f.resolve().as_uri())
     out.write(json.dumps({"type": "scan_end", "roots": [Path(r).resolve().as_uri() for r in a.roots],

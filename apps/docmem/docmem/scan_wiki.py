@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import PROTOCOL
-from .extract.wikiplain import EXTRACTOR, to_markdown
+from .extract.wikiplain import EXTRACTOR, to_markdown_with_links
 from .scan import scan_bytes
 from .sources import USER_AGENT, fetch
 
@@ -174,8 +174,8 @@ def emit(out, rec: dict, target_words: int, max_words: int) -> str:
         "revid": revid,
         "url": "https://en.wikipedia.org/wiki/" + title.replace(" ", "_"),
     }
-    md = to_markdown(title, text).encode("utf-8")
-    for r in scan_bytes(md, doc, title, target_words, max_words):
+    md, links = to_markdown_with_links(title, text)
+    for r in scan_bytes(md.encode("utf-8"), doc, title, target_words, max_words, links=links):
         out.write(json.dumps(r, ensure_ascii=False) + "\n")
     return doc["uri"]
 
