@@ -11,6 +11,7 @@ USAGE = """usage: docmem <command> ...
   scan-wiki  random Wikipedia articles from the dump (by HTTP Range), linked to their revisions
   refresh    close the index's gaps with one more read per source
   improve    link entities across documents, group topics (stored records only, no source reads)
+  kwsearch   BM25 keyword search over an index's passages (no vectors, no LLM)
 """
 
 
@@ -35,6 +36,8 @@ def main():
         from .improve import main as m
     elif cmd == "stats":
         from .ask import stats_main as m
+    elif cmd == "kwsearch":
+        from .keywords import main as m
     else:
         raise SystemExit(USAGE)
     m(argv)

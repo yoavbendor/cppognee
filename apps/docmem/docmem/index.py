@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from . import PROTOCOL, store
+from .keywords import KeywordIndex
 from .store import log
 
 
@@ -102,8 +103,11 @@ async def plan_doc(graph, doc: dict, sections: list[dict], passages: list[dict],
         f.enriched_by = old[str(f.id)].get("enriched_by", "")
         return {"embed": [], "graph": pas + secs + [f] + link_nodes, "delete": [], "file": f, "passages": pas,
                 "raw": passages, "new": new_idx, "edges": link_edges}
+    # the keyword index takes each new passage's text once, and forgets the passages that are gone
+    kw_add = [(str(p.id), passages[i]["text"]) for i, p in enumerate(pas) if str(p.id) not in old_pas]
+    kw_del = sorted(old_pas - {str(p.id) for p in pas})
     return {"embed": embed + sec_embed + [f], "graph": keep + sec_keep + link_nodes, "delete": delete, "file": f,
-            "edges": link_edges,
+            "edges": link_edges, "kw_add": kw_add, "kw_del": kw_del,
             "passages": pas, "raw": passages, "new": new_idx}
 
 
@@ -247,7 +251,7 @@ async def write(plan_embed, plan_graph, delete_ids, st: Stats, edges=None):
     st["store_seconds"] += time.time() - t
 
 
-async def prune(graph, roots: list[str], seen: set[str], st: Stats):
+async def prune(graph, roots: list[str], seen: set[str], st: Stats, kw: KeywordIndex | None = None):
     nodes, _ = await graph.get_filtered_graph_data([{"type": ["DocFile"]}], include_edges=False)
     gone = []
     for n in nodes:
@@ -257,9 +261,13 @@ async def prune(graph, roots: list[str], seen: set[str], st: Stats):
             gone.append(uri)
     if not gone:
         return
-    ids = [n["id"] for t in ("DocPassage", "DocSection", "DocFile") for n in await store.nodes_of(graph, t, gone)]
+    passage_ids = [n["id"] for n in await store.nodes_of(graph, "DocPassage", gone)]
+    ids = passage_ids + [n["id"] for t in ("DocSection", "DocFile") for n in await store.nodes_of(graph, t, gone)]
     st["docs_removed"] += len(gone)
     await write([], [], ids, st)
+    if kw:
+        kw.delete(passage_ids)
+        kw.flush()
 
 
 async def run(lines, a):
@@ -269,7 +277,9 @@ async def run(lines, a):
     graph, _ = await store.engines()
     st = Stats(batches=0)
     t0 = time.time()
+    kw = None if a.no_keywords else KeywordIndex(a.db, create=True)
     pend_embed, pend_graph, pend_delete, pend_edges = [], [], [], []
+    pend_kw_add, pend_kw_del = [], []
     doc, sections, passages, links = None, [], [], []
     scan_end = None
     window = []
@@ -281,7 +291,7 @@ async def run(lines, a):
                                en.Budget(a.enrich_max_calls, a.enrich_max_tokens), json_mode=not a.no_json_mode)
 
     async def drain_window():
-        nonlocal pend_embed, pend_graph, pend_delete, pend_edges, window
+        nonlocal pend_embed, pend_graph, pend_delete, pend_edges, pend_kw_add, pend_kw_del, window
         if enricher and window:
             t = time.time()
             await enrich_plans(window, enricher, a, st)
@@ -291,16 +301,24 @@ async def run(lines, a):
             pend_graph += plan["graph"]
             pend_delete += plan["delete"]
             pend_edges += plan.get("edges", [])
+            pend_kw_add += plan.get("kw_add", [])
+            pend_kw_del += plan.get("kw_del", [])
         window = []
 
     async def flush():
-        nonlocal pend_embed, pend_graph, pend_delete, pend_edges
+        nonlocal pend_embed, pend_graph, pend_delete, pend_edges, pend_kw_add, pend_kw_del
         if pend_embed or pend_graph or pend_delete:
             await write(pend_embed, pend_graph, pend_delete, st, pend_edges)
+            if kw:  # only once the batch is in the graph and the vector store
+                kw.delete(pend_kw_del)
+                for pid, text in pend_kw_add:
+                    kw.add(pid, text)
+                kw.flush()
             log(f"docmem index: {st['docs_new'] + st['docs_changed'] + st['docs_unchanged']} docs, "
                 f"{st['passages_embedded']} passages embedded, {st['passages_kept']} kept, "
                 f"{time.time() - t0:.0f}s")
         pend_embed, pend_graph, pend_delete, pend_edges = [], [], [], []
+        pend_kw_add, pend_kw_del = [], []
 
     for n, line in enumerate(lines, 1):
         if not line.strip():
@@ -339,9 +357,11 @@ async def run(lines, a):
     if a.prune:
         if scan_end is None:
             raise SystemExit("docmem index: --prune needs a complete scan (no scan_end record)")
-        await prune(graph, scan_end["roots"], set(scan_end["uris"]), st)
+        await prune(graph, scan_end["roots"], set(scan_end["uris"]), st, kw)
     st["seconds"] = round(time.time() - t0, 1)
     st["store_seconds"] = round(st["store_seconds"], 1)
+    if kw:
+        st["keywords"] = kw.stats()
     if enricher:
         st["enrich_seconds"] = round(st["enrich_seconds"], 1)
         st["enrich_usage"] = enricher.budget.as_dict()
@@ -369,6 +389,9 @@ def parser(prog="docmem index", doc=__doc__):
     ap.add_argument("--enrich-max-calls", type=int, help="stop calling after this many (the rest become gaps)")
     ap.add_argument("--enrich-max-tokens", type=int, help="stop after this many prompt+completion tokens")
     ap.add_argument("--no-json-mode", action="store_true", help="the server does not take response_format")
+    ap.add_argument("--no-keywords", action="store_true",
+                    help="do not build the keyword (BM25) index; passages it would have covered are not searchable "
+                         "by kwsearch, so re-index into a new --db to add them later")
     return ap
 
 

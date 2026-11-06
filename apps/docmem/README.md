@@ -114,6 +114,27 @@ Wikipedia articles, with 2,359 headings in total. `examples/wiki_questions.jsonl
 - **Index size:** the index is larger than the text it points to. Most of the graph is cognee's per-node metadata. The
   vectors are float32: 384 × 4 bytes × 7,263.
 
+## Keyword index
+
+`docmem index` also builds a BM25 keyword index beside the vectors, in `<db>/system/databases/docmem_keywords.lancedb`
+(nanolance tables; `--no-keywords` skips it). The indexer reads each new passage's text once: its terms and counts go
+into postings, and the text is dropped.
+
+```sh
+docmem kwsearch --db ~/kb "Riverside College Widnes Ofsted"   # top 10: score, passage id, heading path, uri, line
+```
+
+- **Tokens:** lowercase NFKC runs of letters and digits; internal `-`, `'` and `.` are kept (`REQ-1234`, `o'neill`,
+  `3.5`); a trailing `'s` is dropped. No stemming, no stop words.
+- **Tables:** `kw_passages` (num, passage_id, length, deleted) and `kw_postings` (term, segment, nums, tfs), one postings
+  segment per flush. A BTree on `term` makes a search read only its terms' rows.
+- **Deletes:** a deleted passage is marked in `kw_passages` and drops out of results at once; its postings are removed
+  by compaction.
+- **Size:** `python tools/kw_size.py --db ~/kb` compares the keyword tables with the text they cover, and estimates a
+  delta and bit-packed layout.
+- **Existing indexes:** an index built with `--no-keywords` has no keyword rows for its passages. Index into a new `--db`
+  to add them.
+
 ## What changed in cognee (this fork)
 
 1. **`DataPoint.metadata["store_index_text"] = False`** (LanceDB adapter): the index field is embedded, and the vector
