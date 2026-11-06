@@ -42,11 +42,18 @@ async def retrieve(question: str, k: int, candidates: int | None = None):
             continue  # a vector without its graph node: the indexer was interrupted mid-write
         hits.append({"distance": round(float(r.score), 4), **{k_: n[k_] for k_ in (
             "id", "name", "path", "offset", "length", "line", "end_line", "sha256", "section_offset",
-            "section_length")}})
+            "section_length")}, "extractor": n.get("extractor", ""), "doc_sha256": n.get("doc_sha256", "")})
     for i, h in enumerate(hits, 1):
         h["rank"] = i
         h["uri"] = h.pop("name")
     return hits, {"vector_ms": round(t_vec * 1000, 1), "total_ms": round((time.time() - t) * 1000, 1)}
+
+
+def span(h, offset, length, sha256=None):
+    from . import sources
+
+    return sources.read_span(h["uri"], offset, length, sha256, extractor=h["extractor"] or None,
+                             doc_sha256=h["doc_sha256"] or None)
 
 
 def read_hits(hits, context: str, max_bytes: int):
@@ -60,17 +67,24 @@ def read_hits(hits, context: str, max_bytes: int):
             if span in seen:
                 continue
             seen.add(span)
-            text, status = store.read_span(h["uri"], h["section_offset"], min(h["section_length"], max_bytes))
+            text, status = span(h, h["section_offset"], min(h["section_length"], max_bytes))
             # the section's bytes are not hashed; the passage's are, so check the passage
-            _, status = store.read_span(h["uri"], h["offset"], h["length"], h["sha256"])
+            _, status = span(h, h["offset"], h["length"], h["sha256"])
         else:
-            text, status = store.read_span(h["uri"], h["offset"], h["length"], h["sha256"])
+            text, status = span(h, h["offset"], h["length"], h["sha256"])
         out.append({**h, "text": text, "status": status})
     return out
 
 
+def where(h) -> str:
+    """file.md:12-14 for a local file; the revision URL for a web source."""
+    if h["uri"].startswith("file:"):
+        return f"{store.uri_path(h['uri']).name}:{h['line']}-{h['end_line']}"
+    return h["uri"]
+
+
 def label(h) -> str:
-    return f"{store.uri_path(h['uri']).name}:{h['line']}-{h['end_line']} — {h['path']}"
+    return f"{where(h)} — {h['path']}"
 
 
 def excerpts(hits) -> str:
@@ -146,7 +160,8 @@ def main(argv=None):
         print(r["answer"], "\n")
     for i, h in enumerate(r["hits"], 1):
         flag = "" if h["status"] == "ok" else f"  [{h['status'].upper()}: re-run scan | index]"
-        print(f"[{i}] {h['distance']:.3f}  {label(h)}{flag}\n     {store.uri_path(h['uri'])}#L{h['line']}")
+        link = f"{store.uri_path(h['uri'])}#L{h['line']}" if h["uri"].startswith("file:") else h["uri"]
+        print(f"[{i}] {h['distance']:.3f}  {label(h)}{flag}\n     {link}")
     print(f"\n{json.dumps(r['timing'])}", file=sys.stderr)
 
 
@@ -159,7 +174,7 @@ def stats_main(argv=None):
     async def go():
         graph, vector = await store.engines()
         out = {"embed": cfg["embed"], "dims": cfg["dims"], "vector_backend": cfg["vector_backend"]}
-        for t in ("DocFile", "DocSection", "DocPassage"):
+        for t in ("DocFile", "DocSection", "DocPassage", "DocSummary", "DocEntity", "DocTopic", "DocGap"):
             nodes, _ = await graph.get_filtered_graph_data([{"type": [t]}], include_edges=False)
             out[t] = len(nodes)
         size = {}

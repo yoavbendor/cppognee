@@ -116,12 +116,20 @@ def line_at(data: bytes, offset: int, base_offset: int, base_line: int) -> int:
 
 def scan_file(path: Path, target_words: int, max_words: int):
     data = path.read_bytes()
-    uri = path.resolve().as_uri()
-    st = path.stat()
+    doc = {"uri": path.resolve().as_uri(), "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+           "mtime": path.stat().st_mtime, "title": None}
+    yield from scan_bytes(data, doc, path.stem, target_words, max_words)
+
+
+def scan_bytes(data: bytes, doc: dict, fallback_title: str, target_words: int, max_words: int):
+    """Cut markdown ``data`` into the doc's records. ``doc`` holds the doc record's fields (uri, sha256,
+    size, mtime, and for a derived text "format", "extractor", ...); title None means the first "# "
+    heading, else fallback_title. Offsets are into ``data``."""
+    uri = doc["uri"]
     events = list(blocks(data))
-    title = next((t for kind, lvl, t, *_ in events if kind == "heading" and lvl == 1), path.stem)
-    yield {"type": "doc", "uri": uri, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
-           "mtime": st.st_mtime, "title": title}
+    title = doc.get("title") or next((t for kind, lvl, t, *_ in events if kind == "heading" and lvl == 1),
+                                     fallback_title)
+    yield {"type": "doc", **doc, "title": title}
 
     # sections: (path, level, start, line) in order; a section spans to the next heading of the same or
     # a higher level. The text before the first heading is the section with path [title].

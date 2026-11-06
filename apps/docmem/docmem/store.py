@@ -93,19 +93,28 @@ _models = None
 
 
 def models():
-    """(DocFile, DocSection, DocPassage), defined once cognee is importable."""
+    """The DataPoint types (DocFile, DocSection, DocPassage, DocEntity, DocSummary, DocTopic, DocGap),
+    defined once cognee is importable."""
     global _models
     if _models is None:
         from cognee.low_level import DataPoint
         from pydantic import Field
 
+        class DocTopic(DataPoint):
+            name: str  # LLM-derived; one node per normalized name, shared by documents
+            key: str
+            metadata: dict = {"index_fields": ["name"], "identity_fields": ["key"]}
+
         class DocFile(DataPoint):
-            name: str  # the file:// URI
+            name: str  # the source URI (file:// or a pinned web revision)
             key: str
             title: str
             sha256: str
             size: int
             mtime: float
+            url: str = ""  # the page to show a person (web sources)
+            enriched_by: str = ""
+            topics: list[DocTopic] = []
             metadata: dict = {"index_fields": ["title"], "identity_fields": ["key"]}
 
         class DocSection(DataPoint):
@@ -119,6 +128,16 @@ def models():
             doc: DocFile
             metadata: dict = {"index_fields": ["path"], "identity_fields": ["key"]}
 
+        class DocEntity(DataPoint):
+            """An entity as one document describes it (LLM-derived). ``improve`` links the same
+            entity across documents; nothing merges them at ingest."""
+            name: str
+            key: str
+            kind: str
+            description: str
+            doc_uri: str
+            metadata: dict = {"index_fields": [], "identity_fields": ["key"]}
+
         class DocPassage(DataPoint):
             name: str
             key: str
@@ -130,13 +149,37 @@ def models():
             sha256: str
             section_offset: int  # the enclosing section's byte range, for --context section
             section_length: int
+            # how to get the bytes back: offsets are into the file itself (extractor "") or into the
+            # text the extractor makes from the source whose hash is doc_sha256 (a wiki revision)
+            extractor: str = ""
+            doc_sha256: str = ""
             # embedded, then dropped: not in the graph node (exclude) and not in the vector row
             embed_text: str = Field(default="", exclude=True)
             section: DocSection
+            mentions: list[DocEntity] = []
             metadata: dict = {"index_fields": ["embed_text"], "identity_fields": ["key"],
                               "store_index_text": False}
 
-        _models = (DocFile, DocSection, DocPassage)
+        class DocSummary(DataPoint):
+            name: str
+            key: str
+            text: str  # LLM-written, stored and embedded (searchable)
+            part: int
+            section: DocSection
+            metadata: dict = {"index_fields": ["text"], "identity_fields": ["key"]}
+
+        class DocGap(DataPoint):
+            """Work the one read could not do (enrichment over budget or failed): closed on a later
+            read of the source, all of a document's gaps at once."""
+            name: str
+            key: str
+            kind: str
+            reason: str
+            part: int
+            section: DocSection
+            metadata: dict = {"index_fields": [], "identity_fields": ["key"]}
+
+        _models = (DocFile, DocSection, DocPassage, DocEntity, DocSummary, DocTopic, DocGap)
     return _models
 
 

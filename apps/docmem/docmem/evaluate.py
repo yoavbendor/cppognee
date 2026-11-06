@@ -30,9 +30,14 @@ JUDGE_SYSTEM = (
     "the question, an answer that says so is correct and any factual answer is wrong.")
 
 
+def source_name(h) -> str:
+    """What a question's "file" names: a local file's name, or a web source's title (top of its path)."""
+    return store.uri_path(h["uri"]).name if h["uri"].startswith("file:") else h["path"].split(" › ")[0]
+
+
 def source_rank(hits, src) -> int | None:
     for h in hits:
-        if store.uri_path(h["uri"]).name == src["file"] and (
+        if source_name(h) == src["file"] and (
                 not src.get("heading") or src["heading"].strip().lower() in
                 [p.strip().lower() for p in h["path"].split("›")]):
             return h["rank"]
@@ -53,7 +58,7 @@ async def run(a):
                "first_rank": min(found) if found else None, "sources_found": f"{len(found)}/{len(ranks)}",
                "stale_hits": sum(h["status"] != "ok" for h in hits), "timing": r["timing"],
                "seconds": round(time.time() - t, 2),
-               "hits": [f"{store.uri_path(h['uri']).name}:{h['line']} {h['path']}" for h in hits]}
+               "hits": [ask.label(h) for h in hits]}
         if chat:
             ans = r["answer"]
             row["answer"] = ans

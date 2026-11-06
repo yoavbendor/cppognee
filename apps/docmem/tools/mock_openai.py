@@ -33,6 +33,20 @@ def chat(system, user):
         share = len(words(ref) & words(got)) / max(len(words(ref)), 1)
         return json.dumps({"verdict": "correct" if share > 0.6 else "partial" if share > 0.3 else "wrong",
                            "why": f"word overlap {share:.2f}"})
+    if system.startswith("You extract"):
+        secs = re.split(r"\n## S\d+: ", user)[1:]
+        caps = re.compile(r"\b[A-Z][a-z]+(?: [A-Z][a-z]+)+")
+        ents, n, summaries = {}, 0, []
+        for k, sec in enumerate(secs, 1):
+            parts = re.split(r"\n\[P\d+\] ", "\n" + sec.split("\n", 1)[-1])[1:]
+            summaries.append({"s": k, "summary": (re.split(r"(?<=[.!?])\s", parts[0]) if parts else [""])[0][:200]})
+            for p in parts:
+                n += 1
+                for m in caps.findall(p)[:3]:
+                    ents.setdefault(m, []).append(n)
+        el = [{"name": e, "type": "other", "description": "", "p": ps} for e, ps in list(ents.items())[:12]]
+        rel = [{"source": el[0]["name"], "relation": "related to", "target": el[1]["name"], "p": el[0]["p"][0]}] if len(el) > 1 else []
+        return json.dumps({"summaries": summaries, "entities": el, "relations": rel, "topics": ["mock topic"]})
     best, score = None, 1
     for i, b in enumerate(excerpt_blocks(user), 1):
         for s in re.split(r"(?<=[.!?])\s+", b.split("\n", 1)[-1]):
