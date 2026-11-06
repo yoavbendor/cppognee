@@ -53,7 +53,7 @@ def span(h, offset, length, sha256=None):
     from . import sources
 
     return sources.read_span(h["uri"], offset, length, sha256, extractor=h["extractor"] or None,
-                             doc_sha256=h["doc_sha256"] or None)
+                             doc_sha256=h["doc_sha256"] or None, title=h["path"].split(" › ")[0])
 
 
 def read_hits(hits, context: str, max_bytes: int):

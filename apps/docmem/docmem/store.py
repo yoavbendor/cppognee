@@ -175,6 +175,7 @@ def models():
             key: str
             kind: str
             reason: str
+            path: str  # the section's heading path
             part: int
             section: DocSection
             metadata: dict = {"index_fields": [], "identity_fields": ["key"]}

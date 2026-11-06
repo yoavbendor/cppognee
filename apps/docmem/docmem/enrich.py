@@ -23,8 +23,9 @@ SYSTEM = (
     ' "relations": [{"source": "<entity name>", "relation": "<verb phrase, snake_case>", "target": '
     '"<entity name>", "p": <passage number>}],\n'
     ' "topics": ["<2 to 5 broad subjects of the document>"]}\n'
-    "One summary per section number. Only entities that matter to the text (at most 12), only relations "
-    "stated in it (at most 12). Use only the excerpts.")
+    "One summary per section number. Only entities that matter to the text (at most 8), only relations "
+    "stated in it between those entities (at most 6). Descriptions of at most 6 words. Use only the "
+    "excerpts. Keep the reply short: its length is the main cost.")
 
 WORD = re.compile(r"\S+")
 
@@ -85,10 +86,11 @@ def prompt(title: str, group, passages) -> str:
 class Budget:
     def __init__(self, max_calls=None, max_tokens=None):
         self.max_calls, self.max_tokens = max_calls, max_tokens
-        self.calls = self.prompt_tokens = self.completion_tokens = self.failed = 0
+        self.calls = self.prompt_tokens = self.completion_tokens = self.failed = self.in_flight = 0
 
     def spent(self) -> bool:
-        return (self.max_calls is not None and self.calls >= self.max_calls) or (
+        """Whether another call would go over: calls in flight count against the call budget."""
+        return (self.max_calls is not None and self.calls + self.in_flight >= self.max_calls) or (
             self.max_tokens is not None and self.prompt_tokens + self.completion_tokens >= self.max_tokens)
 
     def as_dict(self):
@@ -98,7 +100,7 @@ class Budget:
 
 class Enricher:
     def __init__(self, api_base, api_key, model, concurrency=2, budget=None, json_mode=True,
-                 max_tokens=700):
+                 max_tokens=500):
         from openai import AsyncOpenAI
 
         api_base = api_base or os.environ.get("DOCMEM_API_BASE")
@@ -114,9 +116,13 @@ class Enricher:
 
     async def call(self, user: str):
         kw = {"response_format": {"type": "json_object"}} if self.json_mode else {}
-        r = await self.client.chat.completions.create(
-            model=self.model, temperature=0, max_tokens=self.max_tokens,
-            messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}], **kw)
+        self.budget.in_flight += 1
+        try:
+            r = await self.client.chat.completions.create(
+                model=self.model, temperature=0, max_tokens=self.max_tokens,
+                messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}], **kw)
+        finally:
+            self.budget.in_flight -= 1
         self.budget.calls += 1
         if r.usage:
             self.budget.prompt_tokens += r.usage.prompt_tokens or 0

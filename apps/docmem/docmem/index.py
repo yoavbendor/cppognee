@@ -29,17 +29,24 @@ async def existing(graph, ids: list[str]) -> dict:
     return {n["id"]: store.node_props(n) for n in await graph.get_nodes(ids)} if ids else {}
 
 
-async def plan_doc(graph, doc: dict, sections: list[dict], passages: list[dict], force: bool, st: Stats):
-    """(embed, graph_only, delete_ids) for one scanned document."""
+async def plan_doc(graph, doc: dict, sections: list[dict], passages: list[dict], force: bool, st: Stats,
+                   gap_paths: set | None = None):
+    """The writes for one scanned document: {"embed", "graph", "delete", ...}, or None when it is unchanged.
+    With gap_paths (a refresh), an unchanged document is not skipped: its passages in those sections are
+    enriched again, and nothing is re-embedded."""
     DocFile, DocSection, DocPassage, *_ = store.models()
     uri = doc["uri"]
     f = DocFile(name=uri, key=store.key("file", uri), title=doc["title"], sha256=doc["sha256"],
                 size=doc["size"], mtime=doc["mtime"], url=doc.get("url", ""))
     old = await existing(graph, [str(f.id)])
-    if old and old[str(f.id)].get("sha256") == doc["sha256"] and not force:
+    unchanged = old and old[str(f.id)].get("sha256") == doc["sha256"] and not force
+    if unchanged and not gap_paths:
         st["docs_unchanged"] += 1
         return None
-    st["docs_new" if not old else "docs_changed"] += 1
+    if unchanged:
+        st["docs_refreshed"] += 1
+    else:
+        st["docs_new" if not old else "docs_changed"] += 1
 
     sec_by_path, secs, seen = {}, [], {}
     for s in sections:
@@ -88,6 +95,12 @@ async def plan_doc(graph, doc: dict, sections: list[dict], passages: list[dict],
     sec_embed = [s for s in secs if str(s.id) not in old_secs]
     sec_keep = [s for s in secs if str(s.id) in old_secs]
     new_idx = {i for i, p in enumerate(pas) if str(p.id) not in old_pas}
+    if gap_paths:
+        new_idx |= {i for i, p in enumerate(pas) if p.path in gap_paths}
+    if unchanged:  # a refresh of an unchanged document: graph writes only, keep its earlier enrichment
+        f.enriched_by = old[str(f.id)].get("enriched_by", "")
+        return {"embed": [], "graph": pas + secs + [f], "delete": [], "file": f, "passages": pas,
+                "raw": passages, "new": new_idx}
     return {"embed": embed + sec_embed + [f], "graph": keep + sec_keep, "delete": delete, "file": f,
             "passages": pas, "raw": passages, "new": new_idx}
 
@@ -116,7 +129,7 @@ async def enrich_plans(plans, enricher, a, st: Stats):
         def gap_for(path, part, idx, why):
             sec = pas[idx[0]].section
             return DocGap(name=uri, key=store.key("gap", uri, sec.key, part, "enrich"), kind="enrich",
-                          reason=why or "", part=part, section=sec)
+                          reason=why or "", path=path, part=part, section=sec)
 
         if rec is None:
             plan["embed"] += [gap_for(path, part, idx, reason) for path, part, idx in g]
@@ -272,7 +285,8 @@ async def run(lines, a):
         elif t == "end":
             if doc is None or r["uri"] != doc["uri"]:
                 raise SystemExit(f"docmem index: line {n}: 'end' without its 'doc'")
-            plan = await plan_doc(graph, doc, sections, passages, a.force, st)
+            plan = await plan_doc(graph, doc, sections, passages, a.force, st,
+                                  (getattr(a, "gaps", None) or {}).get(doc["uri"]))
             doc = None
             if plan:
                 window.append(plan)
@@ -298,9 +312,8 @@ async def run(lines, a):
     print(json.dumps(dict(st)))
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(prog="docmem index", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+def parser(prog="docmem index", doc=__doc__):
+    ap = argparse.ArgumentParser(prog=prog, description=doc, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", type=Path, required=True)
     ap.add_argument("--embed", help="embedding model for a new index: fastembed:<model> (default "
                     "fastembed:BAAI/bge-small-en-v1.5) or openai:<model> on --api-base")
@@ -320,6 +333,11 @@ def main(argv=None):
     ap.add_argument("--enrich-max-calls", type=int, help="stop calling after this many (the rest become gaps)")
     ap.add_argument("--enrich-max-tokens", type=int, help="stop after this many prompt+completion tokens")
     ap.add_argument("--no-json-mode", action="store_true", help="the server does not take response_format")
+    return ap
+
+
+def main(argv=None):
+    ap = parser()
     ap.add_argument("input", nargs="?", type=Path, help="read this JSONL file instead of stdin")
     a = ap.parse_args(argv)
     import os
