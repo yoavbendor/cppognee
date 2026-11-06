@@ -3,10 +3,14 @@ import sys
 USAGE = """usage: docmem <command> ...
 
   scan   cut markdown files into sections and passages (JSON lines on stdout)
+  scan-wiki  a random sample of English Wikipedia articles, read from the dump (JSON lines on stdout)
   index  store a scan's stream (stdin) in cognee: vectors and provenance, no text
   ask    answer a question from the index, reading the passages back from the files
   eval   run a question set and score retrieval and answers
   stats  what the index holds and how big it is
+  scan-wiki  random Wikipedia articles from the dump (by HTTP Range), linked to their revisions
+  refresh    close the index's gaps with one more read per source
+  improve    link entities across documents, group topics (stored records only, no source reads)
 """
 
 
@@ -17,12 +21,18 @@ def main():
     cmd, argv = sys.argv[1], sys.argv[2:]
     if cmd == "scan":
         from .scan import main as m
+    elif cmd == "scan-wiki":
+        from .scan_wiki import main as m
     elif cmd == "index":
         from .index import main as m
     elif cmd == "ask":
         from .ask import main as m
     elif cmd == "eval":
         from .evaluate import main as m
+    elif cmd == "refresh":
+        from .refresh import main as m
+    elif cmd == "improve":
+        from .improve import main as m
     elif cmd == "stats":
         from .ask import stats_main as m
     else:
