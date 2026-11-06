@@ -135,6 +135,47 @@ async def expand_links(question: str, hits, n: int, max_degree: int):
     return out, [h["via"] for h in added]
 
 
+async def link_notes(hits) -> list[str]:
+    """Sentences naming how the excerpts are linked, from the link graph (no LLM): excerpts of different
+    documents that link to the same target, and an excerpt linking to the document another one is from."""
+    graph, _ = await store.engines()
+    ids = [h["id"] for h in hits]
+    if not ids:
+        return []
+    rows = await graph.query(
+        "MATCH (p:Node)-[r:EDGE]->(t:Node) WHERE p.id IN $ids AND r.relationship_name = 'links_to' "
+        "RETURN p.id, t.id, t.name", {"ids": ids})
+    pos = {h["id"]: i for i, h in enumerate(hits, 1)}
+    doc_of = {i: h["uri"] for i, h in enumerate(hits, 1)}
+    by_target, names = {}, {}
+    for pid, tid, name in rows:
+        by_target.setdefault(tid, set()).add(pos[pid])
+        names[tid] = name
+    notes = []
+    for tid, ps in by_target.items():
+        if len({doc_of[i] for i in ps}) > 1:
+            ps = sorted(ps)
+            notes.append(f"{', '.join(f'[{i}]' for i in ps[:-1])} and [{ps[-1]}] all mention {names[tid]}."
+                         if len(ps) > 2 else f"[{ps[0]}] and [{ps[1]}] both mention {names[tid]}.")
+    # an excerpt linking to the subject of another excerpt's document
+    subj = await graph.query(
+        "MATCH (f:Node)-[r:EDGE]->(t:Node) WHERE t.id IN $tids AND r.relationship_name = 'is_target' "
+        "RETURN f.name, t.id", {"tids": list(by_target)}) if by_target else []
+    for furi, tid in subj:
+        for j, h in enumerate(hits, 1):
+            if h["uri"] == furi:
+                for i in sorted(by_target[tid]):
+                    if doc_of[i] != furi:
+                        notes.append(f"[{i}] mentions {names[tid]}, which is what [{j}] is about.")
+                break
+    return notes
+
+
+async def notes_for(hits, a):
+    """--link-notes: the notes for the excerpts the model will see (stale ones are not shown)."""
+    return await link_notes([h for h in hits if h["status"] == "ok"]) if a.link_notes else None
+
+
 def read_hits(hits, context: str, max_bytes: int):
     """Attach each hit's text. context "section" reads the enclosing section instead of the passage
     (once per section), cut at max_bytes."""
@@ -179,11 +220,12 @@ def rerank(chat, question: str, hits, k: int):
     return [{**hits[i], "rerank": int(scores[i])} for i in order[:k]]
 
 
-def answer(chat, question: str, hits, system: str = ANSWER_SYSTEM) -> str:
+def answer(chat, question: str, hits, system: str = ANSWER_SYSTEM, notes=None) -> str:
     usable = [h for h in hits if h["status"] == "ok"]
     if not usable:
         return "NOT FOUND: no passage could be read back from its file."
-    return chat.complete(system, f"Excerpts:\n\n{excerpts(usable)}\n\nQuestion: {question}")
+    extra = ("\n\nHow the excerpts are linked:\n" + "\n".join(notes)) if notes else ""
+    return chat.complete(system, f"Excerpts:\n\n{excerpts(usable)}{extra}\n\nQuestion: {question}")
 
 
 def search_queries(reply: str) -> list[str]:
@@ -231,7 +273,7 @@ async def ask_one(question: str, a, chat):
         t = time.time()
         if a.hops > 0:
             for _ in range(a.hops):
-                reply = answer(chat, question, hits, ANSWER_SYSTEM_HOPS)
+                reply = answer(chat, question, hits, ANSWER_SYSTEM_HOPS, await notes_for(hits, a))
                 queries = search_queries(reply)
                 if not queries:
                     text = reply
@@ -240,9 +282,9 @@ async def ask_one(question: str, a, chat):
                 hits = await follow(queries, hits, a)
             else:
                 # still asking after the last hop: answer from everything gathered, without the option
-                text = answer(chat, question, hits)
+                text = answer(chat, question, hits, notes=await notes_for(hits, a))
         else:
-            text = answer(chat, question, hits)
+            text = answer(chat, question, hits, notes=await notes_for(hits, a))
         timing["answer_s"] = round(time.time() - t, 2)
     calls = chat.usage["calls"] - before if chat else 0
     return {"question": question, "answer": text, "hits": hits, "timing": timing,
@@ -266,6 +308,8 @@ def add_common(ap):
                          "linked document itself), ranked by similarity; no LLM; 0 = off")
     ap.add_argument("--link-max-degree", type=int, default=50,
                     help="do not follow targets linked from more passages than this (too common)")
+    ap.add_argument("--link-notes", action="store_true",
+                    help="tell the model how the excerpts are linked (shared link targets), from the graph")
     ap.add_argument("--hops", type=int, default=0, metavar="N",
                     help="multi-hop: when the model asks for SEARCH:, retrieve for each query and ask again, "
                          "at most N times, then answer (at most N+1 answer calls); 0 = off")
