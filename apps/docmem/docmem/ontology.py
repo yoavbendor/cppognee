@@ -260,8 +260,10 @@ async def passages_of_docs(graph, doc_ids: list[str]) -> dict[str, list[str]]:
     return out
 
 
-async def concepts_of_docs(graph, doc_ids: list[str], min_level: int) -> dict[str, dict[str, str]]:
-    """DocFile id -> {concept id: label} for its about_concept concepts at min_level or deeper."""
+async def concepts_of_docs(graph, doc_ids: list[str], min_level: int,
+                           scheme: str | None = None) -> dict[str, dict[str, str]]:
+    """DocFile id -> {concept id: label} for its about_concept concepts at min_level or deeper (of one
+    scheme, if given)."""
     rows = await graph.query(
         "MATCH (f:Node)-[r:EDGE]->(c:Node) WHERE f.id IN $ids AND r.relationship_name = $rel RETURN f.id, c.id",
         {"ids": doc_ids, "rel": ABOUT})
@@ -270,7 +272,7 @@ async def concepts_of_docs(graph, doc_ids: list[str], min_level: int) -> dict[st
     out: dict[str, dict[str, str]] = defaultdict(dict)
     for f, c in rows:
         p = props.get(str(c))
-        if p is not None and p.get("level", 0) >= min_level:
+        if p is not None and p.get("level", 0) >= min_level and (scheme is None or p.get("scheme") == scheme):
             out[str(f)][str(c)] = p["name"]
     return out
 

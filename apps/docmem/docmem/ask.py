@@ -188,7 +188,7 @@ async def expand_links(question: str, hits, n: int, max_degree: int):
     return out, [h["via"] for h in added]
 
 
-async def expand_concepts(question: str, hits, n: int):
+async def expand_concepts(question: str, hits, n: int, scheme: str | None = None):
     """Add up to n passages of OTHER documents that share a concept with the hits' documents, ranked by the
     question's similarity to their stored vectors; no LLM. Only concepts at CONCEPT_MIN_LEVEL or deeper are
     followed, so a broad one like "sport" does not pull in every sports article."""
@@ -200,7 +200,7 @@ async def expand_concepts(question: str, hits, n: int):
     if not own:
         return hits, []
     shared = {}
-    for concepts in (await ontology.concepts_of_docs(graph, list(own), ontology.CONCEPT_MIN_LEVEL)).values():
+    for concepts in (await ontology.concepts_of_docs(graph, list(own), ontology.CONCEPT_MIN_LEVEL, scheme)).values():
         shared.update(concepts)
     if not shared:
         return hits, []
@@ -357,7 +357,7 @@ async def ask_one(question: str, a, chat):
         timing["terms_ms"] = round((time.time() - t) * 1000, 1)
     if a.concepts:
         t = time.time()
-        hits, by_concepts = await expand_concepts(question, hits, a.concepts)
+        hits, by_concepts = await expand_concepts(question, hits, a.concepts, a.concept_scheme)
         linked += by_concepts
         timing["concepts_ms"] = round((time.time() - t) * 1000, 1)
     if a.links:
@@ -418,6 +418,7 @@ def add_common(ap):
     ap.add_argument("--concepts", type=int, default=0, metavar="N",
                     help="add up to N passages of other documents sharing a concept (level 2 or deeper, from "
                          "docmem classify) with the hits' documents, ranked by similarity; no LLM; 0 = off")
+    ap.add_argument("--concept-scheme", help="--concepts follows only this scheme's concepts (default: all)")
     ap.add_argument("--link-notes", action="store_true",
                     help="tell the model how the excerpts are linked (shared link targets), from the graph")
     ap.add_argument("--hops", type=int, default=0, metavar="N",
