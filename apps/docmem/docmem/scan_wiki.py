@@ -21,6 +21,10 @@ shares of --sample per field (rounded; a field whose pool is too small passes it
 with random.Random(seed). An article linked from several fields is drawn once, for the first field drawn (the
 smallest pool first). Each doc record of such a sample has "field": label.
 
+With --titles FILE, exactly the listed articles are read, in file order, with the same line format as a seed file
+("Title" or "Title|field"; "field" is set on the doc only when given). Titles the dump index does not list, and
+listed pages that are not articles (a redirect, a non-article namespace), are reported on stderr and skipped.
+
 The stream is the scan.py protocol (scan_start, doc, section, passage, end per article, scan_end). A doc's
 uri is the revision it was read from, https://en.wikipedia.org/w/index.php?oldid=N, and its sha256 is that of the
 wikitext (see docmem.sources.read_span for how passages are read back). Progress and the seeded pool sizes go to
@@ -498,6 +502,27 @@ def candidate_articles(source: DumpSource, targets: dict[str, set[str]]):
     return {pid: c for pid, c in judged.items() if c is not None}, report
 
 
+def titles_selection(source: DumpSource, titles: list[tuple[str, str]], out, target_words: int,
+                     max_words: int) -> list[str]:
+    """Write the listed articles to out, in the order of titles; returns the revision URIs written."""
+    located = source.locate({t for t, _ in titles})
+    for t, _ in titles:
+        if t not in located:
+            log(f"not in the dump index: {t!r}")
+    pages: dict[int, dict] = {}
+    source.read(wanted_of(located), lambda pid, rec: pages.__setitem__(pid, rec))
+    uris = []
+    for title, field in titles:
+        if title not in located:
+            continue
+        art = article_of(pages[located[title][1]])
+        if art is None:
+            log(f"not an article (namespace 0, not a redirect): {title!r}")
+            continue
+        uris.append(emit(out, art, target_words, max_words, field=field or None))
+    return uris
+
+
 def seeded_selection(source: DumpSource, seeds, n: int, rng: random.Random, out, target_words: int,
                      max_words: int) -> list[str]:
     """Write the stratified sample of the seeds' articles to out; returns the revision URIs written."""
@@ -541,6 +566,9 @@ def main(argv=None):
     ap.add_argument("--seed-pages", type=Path, default=None,
                     help="seed pages (one title per line, optionally 'title|field'): sample their links, "
                          "stratified by field, instead of drawing at random")
+    ap.add_argument("--titles", type=Path, default=None,
+                    help="article titles, one per line, optionally 'title|field': read exactly these, in file "
+                         "order, instead of drawing at random")
     ap.add_argument(
         "--target-words", type=int, default=180, help="merge blocks up to this many words"
     )
@@ -555,7 +583,13 @@ def main(argv=None):
 
     out = sys.stdout
     out.write(json.dumps({"type": "scan_start", "protocol": PROTOCOL}) + "\n")
-    if a.seed_pages is not None:
+    if a.titles is not None and a.seed_pages is not None:
+        ap.error("--titles and --seed-pages are exclusive")
+    if a.titles is not None:
+        stats = {"streams": 0, "bytes": 0, "draws": 0}
+        source = DumpSource(index, path, size, stats)
+        uris = titles_selection(source, read_seeds(a.titles), out, a.target_words, a.max_words)
+    elif a.seed_pages is not None:
         stats = {"streams": 0, "bytes": 0, "draws": 0}
         source = DumpSource(index, path, size, stats)
         seeds = read_seeds(a.seed_pages)

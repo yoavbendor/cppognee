@@ -4,6 +4,8 @@ which has the two methods DumpSource has (locate, read).
 Run from apps/docmem:  python -m pytest tests/test_wiki_select.py
 """
 
+import io
+import json
 import random
 import sys
 from pathlib import Path
@@ -22,6 +24,7 @@ from docmem.scan_wiki import (  # noqa: E402
     read_seeds,
     redirect_of,
     stratified_sample,
+    titles_selection,
 )
 from docmem.wiki_categories import break_cycles, build, is_maintenance, parent_names, write_turtle  # noqa: E402
 
@@ -238,3 +241,25 @@ def test_turtle_loads_with_the_ontology_reader(tmp_path):
     assert concepts["Sciences"].broader
     lv = levels(list(concepts.values()))  # the ontology's level counts from the scheme's roots, not the documents
     assert lv[concepts["Knowledge"].uri] == 0 and lv[concepts["Sciences"].uri] == 1
+
+
+# titles file
+
+def test_titles_selection_reads_listed_titles_in_file_order(capsys):
+    pages = [
+        page(1, "Alpha", LONG),
+        page(2, "Beta", LONG),
+        page(3, "Gamma", "#REDIRECT [[Alpha]]"),  # not an article: reported, not written
+        page(4, "Delta", LONG),
+    ]
+    titles = [("Delta", "electrical"), ("Gamma", ""), ("Missing", "x"), ("Alpha", ""), ("Beta", "mech")]
+    out = io.StringIO()
+    uris = titles_selection(FakeSource(pages), titles, out, 180, 320)
+    docs = [json.loads(line) for line in out.getvalue().splitlines()]
+    docs = [d for d in docs if d["type"] == "doc"]
+    assert [d["title"] for d in docs] == ["Delta", "Alpha", "Beta"]
+    assert [d.get("field") for d in docs] == ["electrical", None, "mech"]
+    assert uris == [d["uri"] for d in docs]
+    err = capsys.readouterr().err
+    assert "not in the dump index: 'Missing'" in err
+    assert "not an article" in err and "'Gamma'" in err
