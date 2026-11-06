@@ -15,6 +15,7 @@ USAGE = """usage: docmem <command> ...
   ontology   load a SKOS concept scheme (IPTC Media Topics JSON or SKOS RDF) into an index (no LLM)
   classify   link documents and sections to their nearest concepts by stored vectors (no LLM)
   concepts   a document's concepts with scores, or the top levels of the concept tree
+  wiki-categories  the Wikipedia category tree of the indexed articles as a SKOS file (dump read, no LLM)
 """
 
 
@@ -47,6 +48,8 @@ def main():
         from .ontology import classify_main as m
     elif cmd == "concepts":
         from .ontology import concepts_main as m
+    elif cmd == "wiki-categories":
+        from .wiki_categories import main as m
     else:
         raise SystemExit(USAGE)
     m(argv)
