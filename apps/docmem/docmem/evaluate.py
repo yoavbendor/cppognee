@@ -54,7 +54,10 @@ async def run(a):
         hits = r["hits"]
         ranks = [source_rank(hits, s) for s in q.get("sources", [])]
         found = [x for x in ranks if x]
-        row = {"id": q["id"], "question": q["question"], "answerable": bool(q.get("sources")),
+        row = {"id": q["id"], "kind": q.get("kind") or ("single" if len(ranks) == 1 else
+                                                          "two-source" if ranks else "unanswerable"),
+               "all_sources": bool(ranks) and len(found) == len(ranks),
+               "question": q["question"], "answerable": bool(q.get("sources")),
                "first_rank": min(found) if found else None, "sources_found": f"{len(found)}/{len(ranks)}",
                "stale_hits": sum(h["status"] != "ok" for h in hits), "timing": r["timing"],
                "seconds": round(time.time() - t, 2),
@@ -82,6 +85,11 @@ def summarize(rows, a, usage):
     for k in sorted({1, 3, a.k}):
         s[f"hit@{k}"] = round(sum(1 for r in ans if r["first_rank"] and r["first_rank"] <= k) / max(len(ans), 1), 3)
     s["mrr"] = round(sum(1 / r["first_rank"] for r in ans if r["first_rank"]) / max(len(ans), 1), 3)
+    for kind in sorted({r["kind"] for r in ans}):
+        rs = [r for r in ans if r["kind"] == kind]
+        s[f"{kind}: all sources in top {a.k}"] = f"{sum(r['all_sources'] for r in rs)}/{len(rs)}"
+        if "answer" in rows[0]:
+            s[f"{kind}: contains must_include"] = f"{sum(r['contains'] for r in rs)}/{len(rs)}"
     s["retrieval_ms_median"] = sorted(r["timing"]["total_ms"] for r in rows)[len(rows) // 2]
     if "answer" in rows[0]:
         s["contains_must_include"] = round(sum(r["contains"] for r in ans) / max(len(ans), 1), 3)
@@ -99,10 +107,10 @@ def summarize(rows, a, usage):
 def report_md(s, rows) -> str:
     out = ["# docmem eval", "", "| metric | value |", "|---|---|"]
     out += [f"| {k} | {v} |" for k, v in s.items()]
-    out += ["", "| id | rank | sources | judge | contains | answer |", "|---|---|---|---|---|---|"]
+    out += ["", "| id | kind | rank | sources | judge | contains | answer |", "|---|---|---|---|---|---|---|"]
     for r in rows:
         ans = (r.get("answer") or "").replace("\n", " ").replace("|", "\\|")[:160]
-        out.append(f"| {r['id']} | {r['first_rank'] if r['answerable'] else '—'} | {r['sources_found']} | "
+        out.append(f"| {r['id']} | {r['kind']} | {r['first_rank'] if r['answerable'] else '—'} | {r['sources_found']} | "
                    f"{r.get('judge', '')} | {r.get('contains', '')} | {ans} |")
     return "\n".join(out) + "\n"
 
