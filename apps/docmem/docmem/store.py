@@ -93,7 +93,8 @@ _models = None
 
 
 def models():
-    """The DataPoint types (DocFile, DocSection, DocPassage, DocEntity, DocSummary, DocTopic, DocGap),
+    """The DataPoint types (DocFile, DocSection, DocPassage, DocEntity, DocSummary, DocTopic, DocGap,
+    DocTarget),
     defined once cognee is importable."""
     global _models
     if _models is None:
@@ -104,6 +105,15 @@ def models():
             name: str  # LLM-derived; one node per normalized name, shared by documents
             key: str
             metadata: dict = {"index_fields": ["name"], "identity_fields": ["key"]}
+
+        class DocTarget(DataPoint):
+            """What a link points at: a wiki title, a URL, a file, an ID (REQ-123) or a category. One
+            node per target, shared by every passage that links to it; a document that IS the target
+            has an "is_target" edge to it. No LLM involved."""
+            name: str
+            key: str
+            kind: str
+            metadata: dict = {"index_fields": [], "identity_fields": ["key"]}
 
         class DocFile(DataPoint):
             name: str  # the source URI (file:// or a pinned web revision)
@@ -180,8 +190,21 @@ def models():
             section: DocSection
             metadata: dict = {"index_fields": [], "identity_fields": ["key"]}
 
-        _models = (DocFile, DocSection, DocPassage, DocEntity, DocSummary, DocTopic, DocGap)
+        _models = (DocFile, DocSection, DocPassage, DocEntity, DocSummary, DocTopic, DocGap, DocTarget)
     return _models
+
+
+def target(kind: str, name: str):
+    """The DocTarget node for a link target (a wiki title, a URL, a file:// URI, an ID, a category)."""
+    DocTarget = models()[7]
+    return DocTarget(name=name, key=key("target", kind, name), kind=kind)
+
+
+def self_target(doc: dict):
+    """The DocTarget a document itself answers to: its wiki title, else its URI."""
+    if doc.get("extractor") == "wikiplain/1":
+        return target("wiki", doc["title"])
+    return target("file", doc["uri"])
 
 
 def key(*parts) -> str:

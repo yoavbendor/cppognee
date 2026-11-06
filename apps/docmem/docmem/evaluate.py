@@ -67,6 +67,7 @@ async def run(a):
                "first_rank": min(found) if found else None, "sources_found": f"{len(found)}/{len(ranks)}",
                "stale_hits": sum(h["status"] != "ok" for h in hits), "timing": r["timing"],
                "seconds": round(time.time() - t, 2), "searches": r["searches"], "calls": r["calls"],
+               "linked": r["linked"],
                "hits": [ask.label(h) for h in hits]}
         if chat:
             ans = r["answer"]
@@ -95,7 +96,7 @@ def summarize(rows, a, usage):
     for k in sorted({1, 3, a.k}):
         s[f"hit@{k}"] = round(sum(1 for r in ans if r["first_rank"] and r["first_rank"] <= k) / max(len(ans), 1), 3)
     s["mrr"] = round(sum(1 / r["first_rank"] for r in ans if r["first_rank"]) / max(len(ans), 1), 3)
-    gathered = "all sources gathered" if a.hops else f"all sources in top {a.k}"
+    gathered = "all sources gathered" if (a.hops or a.links) else f"all sources in top {a.k}"
     for kind in sorted({r["kind"] for r in ans}):
         rs = [r for r in ans if r["kind"] == kind]
         s[f"{kind}: {gathered}"] = f"{sum(r['all_sources'] for r in rs)}/{len(rs)}"

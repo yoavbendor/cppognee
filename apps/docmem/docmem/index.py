@@ -30,7 +30,7 @@ async def existing(graph, ids: list[str]) -> dict:
 
 
 async def plan_doc(graph, doc: dict, sections: list[dict], passages: list[dict], force: bool, st: Stats,
-                   gap_paths: set | None = None):
+                   gap_paths: set | None = None, links: list[dict] | None = None):
     """The writes for one scanned document: {"embed", "graph", "delete", ...}, or None when it is unchanged.
     With gap_paths (a refresh), an unchanged document is not skipped: its passages in those sections are
     enriched again, and nothing is re-embedded."""
@@ -94,15 +94,48 @@ async def plan_doc(graph, doc: dict, sections: list[dict], passages: list[dict],
     # a doc whose passages all survived keeps its section vectors too
     sec_embed = [s for s in secs if str(s.id) not in old_secs]
     sec_keep = [s for s in secs if str(s.id) in old_secs]
+    link_nodes, link_edges = plan_links(doc, f, pas, links or [], st)
     new_idx = {i for i, p in enumerate(pas) if str(p.id) not in old_pas}
     if gap_paths:
         new_idx |= {i for i, p in enumerate(pas) if p.path in gap_paths}
     if unchanged:  # a refresh of an unchanged document: graph writes only, keep its earlier enrichment
         f.enriched_by = old[str(f.id)].get("enriched_by", "")
-        return {"embed": [], "graph": pas + secs + [f], "delete": [], "file": f, "passages": pas,
-                "raw": passages, "new": new_idx}
-    return {"embed": embed + sec_embed + [f], "graph": keep + sec_keep, "delete": delete, "file": f,
+        return {"embed": [], "graph": pas + secs + [f] + link_nodes, "delete": [], "file": f, "passages": pas,
+                "raw": passages, "new": new_idx, "edges": link_edges}
+    return {"embed": embed + sec_embed + [f], "graph": keep + sec_keep + link_nodes, "delete": delete, "file": f,
+            "edges": link_edges,
             "passages": pas, "raw": passages, "new": new_idx}
+
+
+def plan_links(doc, f, pas, links, st: Stats):
+    """DocTarget nodes and edges for a document's link records: passage -links_to-> target (the anchor
+    text on the edge; a link outside every passage hangs off the file), file -in_category-> category,
+    and file -is_target-> the target the document itself is (its title or URI)."""
+    import bisect
+
+    starts = [p.offset for p in pas]
+    nodes, edges = {}, []
+    me = store.self_target(doc)
+    nodes[me.key] = me
+    edges.append((str(f.id), str(me.id), "is_target", {"edge_text": f"{f.title} is {me.name}"}))
+    for ln in links:
+        t = store.target(ln["kind"], ln["target"])
+        if t.key == me.key:
+            continue  # a link to the document itself
+        nodes.setdefault(t.key, t)
+        t = nodes[t.key]
+        if ln["kind"] == "category":
+            edges.append((str(f.id), str(t.id), "in_category", {"edge_text": f"{f.title} in {t.name}"}))
+            continue
+        i = bisect.bisect_right(starts, ln["offset"]) - 1
+        src = pas[i] if i >= 0 and ln["offset"] < pas[i].offset + pas[i].length else f
+        props = {"edge_text": f"{ln.get('anchor') or t.name} -> {t.name}", "anchor": ln.get("anchor", "")}
+        if ln.get("fragment"):
+            props["fragment"] = ln["fragment"]
+        edges.append((str(src.id), str(t.id), "links_to", props))
+    st["links"] += len(links)
+    st["link_targets"] += len(nodes) - 1
+    return list(nodes.values()), edges
 
 
 async def enrich_plans(plans, enricher, a, st: Stats):
@@ -197,9 +230,10 @@ async def write(plan_embed, plan_graph, delete_ids, st: Stats, edges=None):
                 if await vector.has_collection(coll):
                     await vector.delete_data_points(coll, delete_ids)
         if plan_embed:
-            await add_data_points(plan_embed, ctx=ctx, index_edges=False, custom_edges=edges or None)
-        if plan_graph:
-            await add_data_points(plan_graph, ctx=ctx, graph_only=True)
+            await add_data_points(plan_embed, ctx=ctx, index_edges=False)
+        if plan_graph or edges:
+            # custom edges go last, once both calls have written their endpoints
+            await add_data_points(plan_graph, ctx=ctx, graph_only=True, custom_edges=edges or None)
         return []
 
     t = time.time()
@@ -236,7 +270,7 @@ async def run(lines, a):
     st = Stats(batches=0)
     t0 = time.time()
     pend_embed, pend_graph, pend_delete, pend_edges = [], [], [], []
-    doc, sections, passages = None, [], []
+    doc, sections, passages, links = None, [], [], []
     scan_end = None
     window = []
     enricher = None
@@ -277,16 +311,18 @@ async def run(lines, a):
             if r.get("protocol") != PROTOCOL:
                 raise SystemExit(f"docmem index: stream protocol {r.get('protocol')}, expected {PROTOCOL}")
         elif t == "doc":
-            doc, sections, passages = r, [], []
+            doc, sections, passages, links = r, [], [], []
         elif t == "section":
             sections.append(r)
         elif t == "passage":
             passages.append(r)
+        elif t == "link":
+            links.append(r)
         elif t == "end":
             if doc is None or r["uri"] != doc["uri"]:
                 raise SystemExit(f"docmem index: line {n}: 'end' without its 'doc'")
             plan = await plan_doc(graph, doc, sections, passages, a.force, st,
-                                  (getattr(a, "gaps", None) or {}).get(doc["uri"]))
+                                  (getattr(a, "gaps", None) or {}).get(doc["uri"]), links)
             doc = None
             if plan:
                 window.append(plan)

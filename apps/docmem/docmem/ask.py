@@ -65,6 +65,76 @@ def span(h, offset, length, sha256=None):
                              doc_sha256=h["doc_sha256"] or None, title=h["path"].split(" › ")[0])
 
 
+async def link_neighbours(graph, passage_ids: list[str]):
+    """Passages one link away from the given ones, with no LLM: through every target they link to
+    (wiki title, URL, file, ID), the other passages linking to that target and the passages of the
+    document that is the target. {passage id: [target name, ...]} and {target name: in-degree}."""
+    if not passage_ids:
+        return {}, {}
+    rows = await graph.query(
+        "MATCH (p:Node)-[r:EDGE]->(t:Node) WHERE p.id IN $ids AND r.relationship_name = 'links_to' "
+        "RETURN DISTINCT t.id, t.name", {"ids": passage_ids})
+    targets = {tid: name for tid, name in rows}
+    if not targets:
+        return {}, {}
+    tids = list(targets)
+    via, degree = {}, {}
+    # other passages linking to the same targets
+    for pid, tid in await graph.query(
+            "MATCH (q:Node)-[r:EDGE]->(t:Node) WHERE t.id IN $tids AND r.relationship_name = 'links_to' "
+            "AND q.type = 'DocPassage' RETURN q.id, t.id", {"tids": tids}):
+        degree[targets[tid]] = degree.get(targets[tid], 0) + 1
+        via.setdefault(pid, []).append(targets[tid])
+    # passages of documents that are the targets
+    for pid, tid in await graph.query(
+            "MATCH (f:Node)-[r:EDGE]->(t:Node) WHERE t.id IN $tids AND r.relationship_name = 'is_target' "
+            "MATCH (p:Node)-[r1:EDGE]->(s:Node)-[r2:EDGE]->(f) WHERE r1.relationship_name = 'section' "
+            "AND r2.relationship_name = 'doc' RETURN p.id, t.id", {"tids": tids}):
+        via.setdefault(pid, []).append(targets[tid] + " (its article)")
+    for pid in passage_ids:
+        via.pop(pid, None)
+    return via, degree
+
+
+async def expand_links(question: str, hits, n: int, max_degree: int):
+    """Add up to n passages reached through links from the hits, ranked by the question's similarity to
+    their stored vectors. Targets linked from more than max_degree passages (e.g. a country) are too
+    common to say anything and are not followed."""
+    import numpy as np
+
+    graph, vector = await store.engines()
+    via, degree = await link_neighbours(graph, [h["id"] for h in hits])
+    common = {t for t, d in degree.items() if d > max_degree}
+    cands = {pid: ts for pid, ts in via.items() if any(t not in common for t in ts)}
+    if not cands:
+        return hits, []
+    rows = await vector.retrieve(store.PASSAGES, list(cands), include_vector=True)
+    q = np.asarray((await vector.embedding_engine.embed_text([question]))[0], dtype=np.float32)
+    q /= np.linalg.norm(q) or 1
+    scored = []
+    for r in rows:
+        v = np.asarray(r.payload["vector"], dtype=np.float32)
+        scored.append((1 - float(q @ v / (np.linalg.norm(v) or 1)), str(r.id)))
+    scored.sort()
+    chosen = [pid for _, pid in scored[:n]]
+    nodes = {nd["id"]: store.node_props(nd) for nd in await graph.get_nodes(chosen)}
+    dist = {pid: d for d, pid in scored}
+    added = []
+    for pid in chosen:
+        nd = nodes.get(pid)
+        if nd is None:
+            continue
+        h = {"distance": round(dist[pid], 4), **{k_: nd[k_] for k_ in (
+            "id", "path", "offset", "length", "line", "end_line", "sha256", "section_offset", "section_length")},
+            "extractor": nd.get("extractor", ""), "doc_sha256": nd.get("doc_sha256", ""), "uri": nd["name"],
+            "via": [t for t in cands[pid] if t not in common]}
+        added.append(h)
+    out = hits + added
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, [h["via"] for h in added]
+
+
 def read_hits(hits, context: str, max_bytes: int):
     """Attach each hit's text. context "section" reads the enclosing section instead of the passage
     (once per section), cut at max_bytes."""
@@ -145,6 +215,11 @@ async def follow(queries: list[str], hits, a):
 async def ask_one(question: str, a, chat):
     before = chat.usage["calls"] if chat else 0
     hits, timing = await retrieve(question, a.k, a.rerank or a.k)
+    linked = []
+    if a.links:
+        t = time.time()
+        hits, linked = await expand_links(question, hits, a.links, a.link_max_degree)
+        timing["links_ms"] = round((time.time() - t) * 1000, 1)
     hits = read_hits(hits, a.context, a.max_bytes)
     t = time.time()
     if a.rerank and chat:
@@ -171,7 +246,7 @@ async def ask_one(question: str, a, chat):
         timing["answer_s"] = round(time.time() - t, 2)
     calls = chat.usage["calls"] - before if chat else 0
     return {"question": question, "answer": text, "hits": hits, "timing": timing,
-            "searches": searches, "calls": calls}
+            "searches": searches, "calls": calls, "linked": linked}
 
 
 def add_common(ap):
@@ -186,6 +261,11 @@ def add_common(ap):
                     help="give the model each hit's passage, or its whole enclosing section")
     ap.add_argument("--max-bytes", type=int, default=6000, help="cut a section read at this many bytes")
     ap.add_argument("--no-answer", action="store_true", help="retrieval only; no chat model needed")
+    ap.add_argument("--links", type=int, default=0, metavar="N",
+                    help="add up to N passages one link away from the hits (shared link targets, the "
+                         "linked document itself), ranked by similarity; no LLM; 0 = off")
+    ap.add_argument("--link-max-degree", type=int, default=50,
+                    help="do not follow targets linked from more passages than this (too common)")
     ap.add_argument("--hops", type=int, default=0, metavar="N",
                     help="multi-hop: when the model asks for SEARCH:, retrieve for each query and ask again, "
                          "at most N times, then answer (at most N+1 answer calls); 0 = off")
@@ -224,6 +304,8 @@ def main(argv=None):
         print(r["answer"], "\n")
     for i, h in enumerate(r["hits"], 1):
         flag = "" if h["status"] == "ok" else f"  [{h['status'].upper()}: re-run scan | index]"
+        if h.get("via"):
+            flag += f"  [linked via {', '.join(h['via'][:3])}]"
         link = f"{store.uri_path(h['uri'])}#L{h['line']}" if h["uri"].startswith("file:") else h["uri"]
         print(f"[{i}] {h['distance']:.3f}  {label(h)}{flag}\n     {link}")
     print(f"\n{json.dumps(r['timing'])} calls={r['calls']}", file=sys.stderr)
