@@ -47,6 +47,12 @@ def source_rank(hits, src) -> int | None:
 async def run(a):
     chat = ask.open_db(a)
     qs = [json.loads(line) for line in open(a.questions, encoding="utf-8") if line.strip()]
+    if a.ids:
+        wanted = a.ids.split(",")
+        missing = set(wanted) - {q["id"] for q in qs}
+        if missing:
+            raise SystemExit(f"docmem eval: no such question ids: {', '.join(sorted(missing))}")
+        qs = [q for q in qs if q["id"] in set(wanted)]
     rows = []
     for q in qs:
         t = time.time()
@@ -60,7 +66,7 @@ async def run(a):
                "question": q["question"], "answerable": bool(q.get("sources")),
                "first_rank": min(found) if found else None, "sources_found": f"{len(found)}/{len(ranks)}",
                "stale_hits": sum(h["status"] != "ok" for h in hits), "timing": r["timing"],
-               "seconds": round(time.time() - t, 2),
+               "seconds": round(time.time() - t, 2), "searches": r["searches"], "calls": r["calls"],
                "hits": [ask.label(h) for h in hits]}
         if chat:
             ans = r["answer"]
@@ -75,22 +81,28 @@ async def run(a):
         rows.append(row)
         status = f"rank {row['first_rank']}" if row["answerable"] else "unanswerable"
         extra = f"  judge={row.get('judge')}" if a.judge else (f"  contains={row.get('contains')}" if chat else "")
-        print(f"{q['id']}: {status}{extra}  ({row['seconds']}s)", flush=True)
+        hop = f"  searches={row['searches']}" if a.hops else ""
+        print(f"{q['id']}: {status}{extra}{hop}  ({row['seconds']}s)", flush=True)
     return rows, (chat.usage if chat else None)
 
 
 def summarize(rows, a, usage):
     ans = [r for r in rows if r["answerable"]]
-    s = {"questions": len(rows), "answerable": len(ans), "k": a.k, "context": a.context, "rerank": a.rerank}
+    s = {"questions": len(rows), "answerable": len(ans), "k": a.k, "context": a.context, "rerank": a.rerank,
+         "hops": a.hops}
+    if a.hops:
+        s.update({"hop_k": a.hop_k, "max_passages": a.max_passages})
     for k in sorted({1, 3, a.k}):
         s[f"hit@{k}"] = round(sum(1 for r in ans if r["first_rank"] and r["first_rank"] <= k) / max(len(ans), 1), 3)
     s["mrr"] = round(sum(1 / r["first_rank"] for r in ans if r["first_rank"]) / max(len(ans), 1), 3)
+    gathered = "all sources gathered" if a.hops else f"all sources in top {a.k}"
     for kind in sorted({r["kind"] for r in ans}):
         rs = [r for r in ans if r["kind"] == kind]
-        s[f"{kind}: all sources in top {a.k}"] = f"{sum(r['all_sources'] for r in rs)}/{len(rs)}"
+        s[f"{kind}: {gathered}"] = f"{sum(r['all_sources'] for r in rs)}/{len(rs)}"
         if "answer" in rows[0]:
             s[f"{kind}: contains must_include"] = f"{sum(r['contains'] for r in rs)}/{len(rs)}"
     s["retrieval_ms_median"] = sorted(r["timing"]["total_ms"] for r in rows)[len(rows) // 2]
+    s["llm_calls_per_question"] = round(sum(r["calls"] for r in rows) / max(len(rows), 1), 2)
     if "answer" in rows[0]:
         s["contains_must_include"] = round(sum(r["contains"] for r in ans) / max(len(ans), 1), 3)
         un = [r for r in rows if not r["answerable"]]
@@ -121,6 +133,7 @@ def main(argv=None):
     ask.add_common(ap)
     ap.add_argument("--questions", type=Path, required=True)
     ap.add_argument("--judge", action="store_true", help="grade answers with the chat model")
+    ap.add_argument("--ids", help="comma-separated question ids to run, e.g. m01,w02 (default: all)")
     ap.add_argument("--out", type=Path, help="write results.jsonl, summary.json and report.md here")
     a = ap.parse_args(argv)
     rows, usage = asyncio.run(run(a))

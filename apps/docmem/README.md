@@ -43,6 +43,16 @@ docmem stats --db ~/kb
 - **Changed files:** every passage's SHA-256 is checked when it is read back. A file changed since indexing shows
   `[CHANGED: re-run scan | index]`, and that passage is not given to the model.
 
+### Multi-hop
+
+A question that needs facts from two or three articles often retrieves only one of them, because one question
+embedding lands near one article. With `--hops N` the model may ask for more: if the excerpts lack a fact, it
+replies `SEARCH: <query>` lines, `ask` retrieves `--hop-k` passages (default 3) for each query, adds the new ones
+(no repeats) and asks again. After N rounds, or once the model answers, it answers from everything gathered, capped
+at `--max-passages` (default 10). The number of answer calls is at most N+1. A question answered from the first
+passages costs one call, as before. `ask` prints the searches it made. `eval --hops N` also reports the
+searches and calls per question, and `llm_calls_per_question`. The default `--hops 0` is unchanged.
+
 ## The stream (protocol 1)
 
 One JSON object per line; per document:

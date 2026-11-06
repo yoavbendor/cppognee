@@ -21,6 +21,15 @@ ANSWER_SYSTEM = (
     "If the excerpts do not contain the answer, reply with 'NOT FOUND:' and one sentence on what they "
     "do cover. Do not use outside knowledge.")
 
+# --hops: the same answer prompt, plus a SEARCH option for a fact the excerpts lack.
+ANSWER_SYSTEM_HOPS = (
+    "You answer questions using only the numbered excerpts from the user's documents. "
+    "Cite the excerpts you use as [1], [2]. Be concise: a sentence or a short paragraph. "
+    "If a fact the question needs is missing from the excerpts (another subject, a place, a date, or the "
+    "thing a found fact points to), reply ONLY with 1 or 2 lines, each 'SEARCH: <short search query for "
+    "that fact>', and nothing else. Otherwise answer. Reply 'NOT FOUND:' and one sentence only if the "
+    "excerpts clearly do not cover it. Do not use outside knowledge.")
+
 RERANK_SYSTEM = (
     "You rank document excerpts by how well they answer a question. Reply with JSON only: "
     '{"scores": [s1, s2, ...]}, one integer per excerpt in order, 0 = irrelevant, 1 = related, '
@@ -100,14 +109,41 @@ def rerank(chat, question: str, hits, k: int):
     return [{**hits[i], "rerank": int(scores[i])} for i in order[:k]]
 
 
-def answer(chat, question: str, hits) -> str:
+def answer(chat, question: str, hits, system: str = ANSWER_SYSTEM) -> str:
     usable = [h for h in hits if h["status"] == "ok"]
     if not usable:
         return "NOT FOUND: no passage could be read back from its file."
-    return chat.complete(ANSWER_SYSTEM, f"Excerpts:\n\n{excerpts(usable)}\n\nQuestion: {question}")
+    return chat.complete(system, f"Excerpts:\n\n{excerpts(usable)}\n\nQuestion: {question}")
+
+
+def search_queries(reply: str) -> list[str]:
+    """The queries of a reply's SEARCH: lines; [] when the reply is an answer."""
+    out = []
+    for line in reply.splitlines():
+        s = line.strip()
+        if s[:7].upper() == "SEARCH:" and s[7:].strip():
+            out.append(s[7:].strip())
+    return out
+
+
+async def follow(queries: list[str], hits, a):
+    """Retrieve for each query, add the passages not already gathered (in order), cap the list at
+    --max-passages and renumber the ranks."""
+    have = {h["id"] for h in hits}
+    for q in queries:
+        new, _ = await retrieve(q, a.hop_k)
+        for h in read_hits(new, a.context, a.max_bytes):
+            if h["id"] not in have:
+                have.add(h["id"])
+                hits.append(h)
+    hits = hits[:a.max_passages]
+    for i, h in enumerate(hits, 1):
+        h["rank"] = i
+    return hits
 
 
 async def ask_one(question: str, a, chat):
+    before = chat.usage["calls"] if chat else 0
     hits, timing = await retrieve(question, a.k, a.rerank or a.k)
     hits = read_hits(hits, a.context, a.max_bytes)
     t = time.time()
@@ -115,11 +151,27 @@ async def ask_one(question: str, a, chat):
         hits = rerank(chat, question, hits, a.k)
         timing["rerank_s"] = round(time.time() - t, 2)
     text = None
+    searches = []
     if chat:
         t = time.time()
-        text = answer(chat, question, hits)
+        if a.hops > 0:
+            for _ in range(a.hops):
+                reply = answer(chat, question, hits, ANSWER_SYSTEM_HOPS)
+                queries = search_queries(reply)
+                if not queries:
+                    text = reply
+                    break
+                searches.append(queries)
+                hits = await follow(queries, hits, a)
+            else:
+                # still asking after the last hop: answer from everything gathered, without the option
+                text = answer(chat, question, hits)
+        else:
+            text = answer(chat, question, hits)
         timing["answer_s"] = round(time.time() - t, 2)
-    return {"question": question, "answer": text, "hits": hits, "timing": timing}
+    calls = chat.usage["calls"] - before if chat else 0
+    return {"question": question, "answer": text, "hits": hits, "timing": timing,
+            "searches": searches, "calls": calls}
 
 
 def add_common(ap):
@@ -134,9 +186,17 @@ def add_common(ap):
                     help="give the model each hit's passage, or its whole enclosing section")
     ap.add_argument("--max-bytes", type=int, default=6000, help="cut a section read at this many bytes")
     ap.add_argument("--no-answer", action="store_true", help="retrieval only; no chat model needed")
+    ap.add_argument("--hops", type=int, default=0, metavar="N",
+                    help="multi-hop: when the model asks for SEARCH:, retrieve for each query and ask again, "
+                         "at most N times, then answer (at most N+1 answer calls); 0 = off")
+    ap.add_argument("--hop-k", type=int, default=3, help="passages retrieved per follow-up SEARCH query")
+    ap.add_argument("--max-passages", type=int, default=10,
+                    help="cap on the passages given to the model in total (multi-hop)")
 
 
 def open_db(a):
+    if a.hops < 0 or a.hop_k < 1 or a.max_passages < 1:
+        raise SystemExit("docmem: --hops must be 0 or more; --hop-k and --max-passages at least 1")
     store.configure(a.db, api_base=a.api_base or os.environ.get("DOCMEM_API_BASE"),
                     api_key=a.api_key or os.environ.get("DOCMEM_API_KEY"))
     from .llm import Chat
@@ -156,13 +216,17 @@ def main(argv=None):
     if a.json:
         print(json.dumps(r, ensure_ascii=False, indent=1))
         return
+    for i, qs in enumerate(r["searches"], 1):
+        print(f"search {i}: " + " | ".join(qs))
+    if r["searches"]:
+        print()
     if r["answer"] is not None:
         print(r["answer"], "\n")
     for i, h in enumerate(r["hits"], 1):
         flag = "" if h["status"] == "ok" else f"  [{h['status'].upper()}: re-run scan | index]"
         link = f"{store.uri_path(h['uri'])}#L{h['line']}" if h["uri"].startswith("file:") else h["uri"]
         print(f"[{i}] {h['distance']:.3f}  {label(h)}{flag}\n     {link}")
-    print(f"\n{json.dumps(r['timing'])}", file=sys.stderr)
+    print(f"\n{json.dumps(r['timing'])} calls={r['calls']}", file=sys.stderr)
 
 
 def stats_main(argv=None):
