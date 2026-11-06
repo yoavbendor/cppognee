@@ -148,12 +148,13 @@ async def hybrid(question: str, k: int, db):
 
 
 async def expand_terms(question: str, hits, n: int, db, terms: int = 8):
-    """Add up to n passages of OTHER documents that share the hits' rarest terms (BM25 over those
-    terms), ranked by the question's similarity to their stored vectors; no LLM."""
+    """Add up to n passages of OTHER documents that share rare terms with the hits (bridge terms: in the
+    hits and elsewhere, in few passages), found by BM25 over those terms and ranked by the question's
+    similarity to their stored vectors; no LLM."""
     from .keywords import KeywordIndex
 
     kw = KeywordIndex(db)
-    rare = kw.rare_terms([h["id"] for h in hits], terms)
+    rare = [t for t, _ in kw.bridge_terms([h["id"] for h in hits], terms)]
     if not rare:
         return hits, []
     docs = {h["uri"] for h in hits}

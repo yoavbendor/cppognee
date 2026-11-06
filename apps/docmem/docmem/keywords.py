@@ -251,6 +251,28 @@ class KeywordIndex:
             scored.append((term, idf * sum(tf for x, tf in zip(nums, tfs) if x in target)))
         return sorted(scored, key=lambda s: -s[1])[:n]
 
+    def bridge_terms(self, passage_ids: list[str], n: int = 8, max_df: int = 30) -> list[tuple[str, float]]:
+        """Terms that can lead from these passages to others: they occur in these passages AND in at least
+        one other passage, at most max_df passages in all (rarer is better: scored by idf alone), and are
+        not numbers or shorter than 3 characters. Reads every postings row, like rare_terms."""
+        q = ", ".join(_lit(p) for p in passage_ids)
+        ids = self._passages.query().where(f"passage_id IN ({q})").limit(None).select(["num"]).to_arrow()
+        target = set(ids.column("num").to_pylist())
+        num, _, deleted = self._meta()
+        n_live = int((~deleted).sum())
+        live_set = set(num[~deleted].tolist())
+        t = self._postings.query().limit(None).select(["term", "nums"]).to_arrow()
+        acc: dict[str, set] = defaultdict(set)
+        for term, nums in zip(t.column("term").to_pylist(), t.column("nums").to_pylist()):
+            if len(term) >= 3 and not any(c.isdigit() for c in term):
+                acc[term].update(x for x in nums if x in live_set)
+        scored = []
+        for term, ps in acc.items():
+            inside = ps & target
+            if inside and len(ps) > len(inside) and len(ps) <= max_df:
+                scored.append((term, math.log(1 + (n_live - len(ps) + 0.5) / (len(ps) + 0.5))))
+        return sorted(scored, key=lambda s: -s[1])[:n]
+
     def compact(self) -> None:
         """Rewrite postings as one segment per term, without deleted passages, and drop those passage rows."""
         self.flush()
@@ -262,6 +284,15 @@ class KeywordIndex:
         self._segment = 1
         if rows:
             _index(self._postings, "term")
+
+    def tidy(self) -> None:
+        """Compact both tables' files and drop their old versions. The keyword tables are derived from
+        the passages, so their version history is not kept (the graph and vector tables keep theirs)."""
+        import datetime
+
+        for t in (self._passages, self._postings):
+            t.compact_files()
+            t.cleanup_old_versions(datetime.timedelta(0))
 
     def stats(self) -> dict:
         num, _, deleted = self._meta()

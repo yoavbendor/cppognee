@@ -53,7 +53,12 @@ def _get_node_label(node: Any, node_id: Any) -> str:
         return str(node_id)
 
     metadata = _get_value(node, "metadata") or {}
-    for field in metadata.get("index_fields") or []:
+    # A DataPoint whose indexed text is not stored (store_index_text=False) must not have that
+    # text copied into its edges' labels either.
+    label_fields = (
+        [] if metadata.get("store_index_text") is False else metadata.get("index_fields") or []
+    )
+    for field in label_fields:
         value = _get_nonblank_text(_get_value(node, field))
         if value:
             return _trim_preview(value)

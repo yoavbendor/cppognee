@@ -18,3 +18,10 @@ async def test_excluded_field_is_embeddable_but_not_dumped():
     node = nodes[0]
     assert DataPoint.get_embeddable_data(node) == "only embedded"  # the vector index reads it
     assert "embed_text" not in node.model_dump()  # graph adapters store model_dump()
+
+
+def test_edge_label_never_uses_unstored_index_text():
+    from cognee.modules.graph.utils.prepare_edges_for_storage import _get_node_label
+
+    p = Passage(name="file:///a.md", embed_text="secret passage text")
+    assert _get_node_label(p, p.id) == "file:///a.md"

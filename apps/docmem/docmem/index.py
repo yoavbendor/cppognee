@@ -361,6 +361,7 @@ async def run(lines, a):
     st["seconds"] = round(time.time() - t0, 1)
     st["store_seconds"] = round(st["store_seconds"], 1)
     if kw:
+        kw.tidy()
         st["keywords"] = kw.stats()
     if enricher:
         st["enrich_seconds"] = round(st["enrich_seconds"], 1)
