@@ -90,13 +90,14 @@ async def run(a):
 def summarize(rows, a, usage):
     ans = [r for r in rows if r["answerable"]]
     s = {"questions": len(rows), "answerable": len(ans), "k": a.k, "context": a.context, "rerank": a.rerank,
-         "hops": a.hops}
+         "hops": a.hops, "links": a.links, "terms": a.terms, "concepts": a.concepts}
     if a.hops:
         s.update({"hop_k": a.hop_k, "max_passages": a.max_passages})
     for k in sorted({1, 3, a.k}):
         s[f"hit@{k}"] = round(sum(1 for r in ans if r["first_rank"] and r["first_rank"] <= k) / max(len(ans), 1), 3)
     s["mrr"] = round(sum(1 / r["first_rank"] for r in ans if r["first_rank"]) / max(len(ans), 1), 3)
-    gathered = "all sources gathered" if (a.hops or a.links or a.terms) else f"all sources in top {a.k}"
+    gathered = ("all sources gathered" if (a.hops or a.links or a.terms or a.concepts)
+                else f"all sources in top {a.k}")
     for kind in sorted({r["kind"] for r in ans}):
         rs = [r for r in ans if r["kind"] == kind]
         s[f"{kind}: {gathered}"] = f"{sum(r['all_sources'] for r in rs)}/{len(rs)}"

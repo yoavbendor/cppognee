@@ -12,6 +12,9 @@ USAGE = """usage: docmem <command> ...
   refresh    close the index's gaps with one more read per source
   improve    link entities across documents, group topics (stored records only, no source reads)
   kwsearch   BM25 keyword search over an index's passages (no vectors, no LLM)
+  ontology   load a SKOS concept scheme (IPTC Media Topics JSON or SKOS RDF) into an index (no LLM)
+  classify   link documents and sections to their nearest concepts by stored vectors (no LLM)
+  concepts   a document's concepts with scores, or the top levels of the concept tree
 """
 
 
@@ -38,6 +41,12 @@ def main():
         from .ask import stats_main as m
     elif cmd == "kwsearch":
         from .keywords import main as m
+    elif cmd == "ontology":
+        from .ontology import ontology_main as m
+    elif cmd == "classify":
+        from .ontology import classify_main as m
+    elif cmd == "concepts":
+        from .ontology import concepts_main as m
     else:
         raise SystemExit(USAGE)
     m(argv)

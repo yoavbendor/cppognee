@@ -135,6 +135,27 @@ docmem kwsearch --db ~/kb "Riverside College Widnes Ofsted"   # top 10: score, p
 - **Existing indexes:** an index built with `--no-keywords` has no keyword rows for its passages. Index into a new `--db`
   to add them.
 
+## Concepts from an ontology
+
+`docmem ontology load` stores a concept scheme in the index: IPTC Media Topics JSON (retired concepts skipped) or any
+SKOS RDF file. Each concept is embedded from its label and definition, and has a `broader` edge to its parent.
+`docmem classify` then links each document (and, with `--level both`, each section) to its nearest concepts by the
+cosine similarity between its centroid (the normalized mean of its stored passage vectors) and the concept vectors.
+Re-running replaces the scheme's `about_concept` edges. Nothing calls an LLM and no source file is read.
+
+```sh
+docmem ontology load --db ~/kb --skos mediatopic.json --scheme iptc
+docmem classify --db ~/kb --scheme iptc --top 3
+docmem concepts --db ~/kb --doc "Some Article"    # scores and ancestor chains
+docmem concepts --db ~/kb --tree                  # top two levels, with document counts
+docmem ask --db ~/kb --concepts 3 "question"      # add passages of documents sharing a level-2+ concept
+```
+
+- `--query-prefix` on `ontology load` embeds the concepts with the bge query instruction. It replaces the stored
+  concept vectors for that scheme, so re-load without it to switch back.
+- `--concepts N` (on `ask` and `eval`) follows only concepts at level 2 or deeper; broad ones like "sport" are not
+  followed.
+
 ## What changed in cognee (this fork)
 
 1. **`DataPoint.metadata["store_index_text"] = False`** (LanceDB adapter): the index field is embedded, and the vector

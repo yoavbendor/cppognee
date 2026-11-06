@@ -188,6 +188,42 @@ async def expand_links(question: str, hits, n: int, max_degree: int):
     return out, [h["via"] for h in added]
 
 
+async def expand_concepts(question: str, hits, n: int):
+    """Add up to n passages of OTHER documents that share a concept with the hits' documents, ranked by the
+    question's similarity to their stored vectors; no LLM. Only concepts at CONCEPT_MIN_LEVEL or deeper are
+    followed, so a broad one like "sport" does not pull in every sports article."""
+    from . import ontology
+
+    graph, _ = await store.engines()
+    doc_of = await ontology.docs_of_passages(graph, [h["id"] for h in hits])
+    own = set(doc_of.values())
+    if not own:
+        return hits, []
+    shared = {}
+    for concepts in (await ontology.concepts_of_docs(graph, list(own), ontology.CONCEPT_MIN_LEVEL)).values():
+        shared.update(concepts)
+    if not shared:
+        return hits, []
+    via: dict[str, list[str]] = {}  # other document id -> its shared concepts' labels
+    for cid, fids in (await ontology.docs_with_concepts(graph, list(shared))).items():
+        for fid in fids:
+            if fid not in own:
+                via.setdefault(fid, []).append(shared[cid])
+    if not via:
+        return hits, []
+    cands: dict[str, list[str]] = {}
+    for fid, pids in (await ontology.passages_of_docs(graph, list(via))).items():
+        for pid in pids:
+            cands[pid] = [f"concept: {label}" for label in via[fid]]
+    added = await best_of(question, cands, n)
+    for h in added:
+        h["via"] = cands[h["id"]]
+    out = hits + added
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, [h["via"] for h in added]
+
+
 async def link_notes(hits) -> list[str]:
     """Sentences naming how the excerpts are linked, from the link graph (no LLM): excerpts of different
     documents that link to the same target, and an excerpt linking to the document another one is from."""
@@ -319,6 +355,11 @@ async def ask_one(question: str, a, chat):
         hits, by_terms = await expand_terms(question, hits, a.terms, a.db)
         linked += by_terms
         timing["terms_ms"] = round((time.time() - t) * 1000, 1)
+    if a.concepts:
+        t = time.time()
+        hits, by_concepts = await expand_concepts(question, hits, a.concepts)
+        linked += by_concepts
+        timing["concepts_ms"] = round((time.time() - t) * 1000, 1)
     if a.links:
         t = time.time()
         hits, by_links = await expand_links(question, hits, a.links, a.link_max_degree)
@@ -374,6 +415,9 @@ def add_common(ap):
                          "linked document itself), ranked by similarity; no LLM; 0 = off")
     ap.add_argument("--link-max-degree", type=int, default=50,
                     help="do not follow targets linked from more passages than this (too common)")
+    ap.add_argument("--concepts", type=int, default=0, metavar="N",
+                    help="add up to N passages of other documents sharing a concept (level 2 or deeper, from "
+                         "docmem classify) with the hits' documents, ranked by similarity; no LLM; 0 = off")
     ap.add_argument("--link-notes", action="store_true",
                     help="tell the model how the excerpts are linked (shared link targets), from the graph")
     ap.add_argument("--hops", type=int, default=0, metavar="N",
