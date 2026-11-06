@@ -32,6 +32,8 @@ import bz2
 import calendar
 import hashlib
 import json
+import multiprocessing
+import os
 import random
 import re
 import sys
@@ -40,7 +42,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from array import array
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 import mwparserfromhell
@@ -56,6 +58,7 @@ INDEX_URL = BASE + "-index.txt.bz2"
 DUMP_URL = BASE + ".xml.bz2"
 WIKI = "https://en.wikipedia.org/"
 MAX_CONCURRENT = 4
+JUDGE_BATCH = 64  # candidate pages whose word counts are checked together, in worker processes
 MIN_WORDS = 300  # a seeded article has at least this many words of extracted text
 REDIRECT = re.compile(r"\s*#REDIRECT\s*:?\s*\[\[([^\[\]\n]+)\]\]", re.IGNORECASE)
 TEMPLATE = re.compile(r"\{\{\s*([^|{}\n]+?)\s*[|}]")
@@ -419,64 +422,79 @@ def seed_targets(source: DumpSource, seeds: list[tuple[str, str]]) -> dict[str, 
 def candidate_articles(source: DumpSource, targets: dict[str, set[str]]):
     """The candidate articles the seeds link to, by page id: {pid: {"title", "stream", "fields"}}, with the
     fields each one is linked from; and a count of what was left out, by reason. A redirect among the targets is
-    followed once; its target takes the fields of the redirect."""
+    followed once; its target takes the fields of the redirect. The word counts (article_problem) run in worker
+    processes, a batch at a time; the records are read in this process."""
     report: Counter = Counter()
     judged: dict[int, dict | None] = {}
     redirects: dict[str, set[str]] = {}
+    pending: list[tuple[int, dict]] = []
 
-    def judge(pid: int, stream: int, rec: dict, fields: set[str]) -> None:
-        if pid in judged:
-            if judged[pid] is not None:
-                judged[pid]["fields"] |= fields
-            return
-        why = article_problem(rec)
-        if why:
-            report[why] += 1
-            judged[pid] = None
-            return
-        judged[pid] = {"title": rec["title"], "stream": stream, "fields": set(fields)}
+    # forkserver, not fork: the pool starts while the dump's download threads are alive, and forking a
+    # multi-threaded process can deadlock
+    context = multiprocessing.get_context("forkserver")
+    with ProcessPoolExecutor(min(4, os.cpu_count() or 1), mp_context=context) as procs:
 
-    located = source.locate(set(targets))
-    report["not in dump"] = len(targets) - len(located)
-    where = {pid: (t, s) for t, (s, pid) in located.items()}
+        def flush() -> None:
+            if not pending:
+                return
+            for (pid, _), why in zip(pending, procs.map(article_problem, [rec for _, rec in pending])):
+                if why:
+                    report[why] += 1
+                    judged[pid] = None
+            pending.clear()
 
-    def first(pid: int, rec: dict | None) -> None:
-        title, stream = where[pid]
-        if rec is None or rec["ns"] != "0":
-            report["not an article"] += 1
-        elif rec["redirect"]:
-            dest = redirect_of(rec["text"])
-            if dest is not None and dest[0] == "wiki" and dest[1]:
-                redirects.setdefault(dest[1], set()).update(targets[title])
-                report["redirects followed"] += 1
+        def judge(pid: int, stream: int, rec: dict, fields: set[str]) -> None:
+            if pid in judged:
+                if judged[pid] is not None:
+                    judged[pid]["fields"] |= fields
+                return
+            judged[pid] = {"title": rec["title"], "stream": stream, "fields": set(fields)}
+            pending.append((pid, rec))
+            if len(pending) >= JUDGE_BATCH:
+                flush()
+
+        located = source.locate(set(targets))
+        report["not in dump"] = len(targets) - len(located)
+        where = {pid: (t, s) for t, (s, pid) in located.items()}
+
+        def first(pid: int, rec: dict | None) -> None:
+            title, stream = where[pid]
+            if rec is None or rec["ns"] != "0":
+                report["not an article"] += 1
+            elif rec["redirect"]:
+                dest = redirect_of(rec["text"])
+                if dest is not None and dest[0] == "wiki" and dest[1]:
+                    redirects.setdefault(dest[1], set()).update(targets[title])
+                    report["redirects followed"] += 1
+                else:
+                    report["redirect elsewhere"] += 1
             else:
-                report["redirect elsewhere"] += 1
-        else:
-            judge(pid, stream, rec, targets[title])
+                judge(pid, stream, rec, targets[title])
 
-    source.read(wanted_of(located), first)
+        source.read(wanted_of(located), first)
 
-    todo = {}
-    for title, fields in redirects.items():
-        if title in located and located[title][1] in judged:
-            if judged[located[title][1]] is not None:
-                judged[located[title][1]]["fields"] |= fields
-        else:
-            todo[title] = fields
-    located2 = source.locate(set(todo))
-    report["redirect targets not in dump"] = len(todo) - len(located2)
-    where2 = {pid: (t, s) for t, (s, pid) in located2.items()}
+        todo = {}
+        for title, fields in redirects.items():
+            if title in located and located[title][1] in judged:
+                if judged[located[title][1]] is not None:
+                    judged[located[title][1]]["fields"] |= fields
+            else:
+                todo[title] = fields
+        located2 = source.locate(set(todo))
+        report["redirect targets not in dump"] = len(todo) - len(located2)
+        where2 = {pid: (t, s) for t, (s, pid) in located2.items()}
 
-    def second(pid: int, rec: dict | None) -> None:
-        title, stream = where2[pid]
-        if rec is None or rec["ns"] != "0":
-            report["redirect target not an article"] += 1
-        elif rec["redirect"]:
-            report["double redirect"] += 1
-        else:
-            judge(pid, stream, rec, todo[title])
+        def second(pid: int, rec: dict | None) -> None:
+            title, stream = where2[pid]
+            if rec is None or rec["ns"] != "0":
+                report["redirect target not an article"] += 1
+            elif rec["redirect"]:
+                report["double redirect"] += 1
+            else:
+                judge(pid, stream, rec, todo[title])
 
-    source.read(wanted_of(located2), second)
+        source.read(wanted_of(located2), second)
+        flush()
     return {pid: c for pid, c in judged.items() if c is not None}, report
 
 

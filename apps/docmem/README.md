@@ -156,6 +156,21 @@ docmem ask --db ~/kb --concepts 3 "question"      # add passages of documents sh
 - `--concepts N` (on `ask` and `eval`) follows only concepts at level 2 or deeper; broad ones like "sport" are not
   followed.
 
+## Wikipedia samples by topic and their category concepts
+
+`docmem scan-wiki --seed-pages FILE` samples the articles that seed pages link to, not random articles. FILE has one
+exact index title per line, optionally `title|field` (`examples/engineering_seeds.txt`). Each seed's article links are
+the candidates; a redirect is followed once; disambiguation, list / outline / glossary / index pages and pages under
+300 words are left out. The sample is stratified by field (equal shares, rounded; a small field's leftover goes to the
+others), each article is drawn once, and every doc record carries `"field"`. Without `--seed-pages` the sample is random,
+as before. Pool sizes, per-field counts and downloaded MB go to stderr.
+
+`docmem wiki-categories --db DB --cache DIR --out FILE.ttl --depth 2` turns the Wikipedia categories of the indexed
+articles into a SKOS concept scheme: each category page is read from the dump, its parents up to `--depth` levels are
+added, maintenance categories are dropped and cycles are broken (the closing edge is dropped and counted). Load it with
+`docmem ontology load --skos FILE.ttl --scheme NAME`. `FILE.doc_categories.json` (next to the Turtle file) maps each
+indexed title to its kept categories, for evaluation. Nothing calls an LLM; category texts are not written to disk.
+
 ## What changed in cognee (this fork)
 
 1. **`DataPoint.metadata["store_index_text"] = False`** (LanceDB adapter): the index field is embedded, and the vector

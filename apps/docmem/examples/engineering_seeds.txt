@@ -20,7 +20,7 @@ Outline of transport|transport
 Outline of rail transport|transport
 Glossary of rail transport terms|transport
 Glossary of nautical terms|maritime
-List of ships|maritime
+Ship|maritime
 Outline of control engineering|control
 Outline of automation|control
 Outline of robotics|robotics

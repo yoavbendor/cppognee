@@ -6,7 +6,8 @@ The concepts are the categories the indexed documents are in (DocFile -in_catego
 page is read from the dump through the index, as scan-wiki reads articles, and its [[Category:...]] links are its
 parents. --depth N reads the pages of the categories up to N levels from the documents: depth 2 keeps the
 document categories, their parents and their grandparents, with the broader edges among them (a grandparent's
-own parents are not read, so the top level has no edges up). A category whose page is missing from the dump is
+own parents are not read, so the top level has no edges up). Depth 0 keeps the document categories and the
+broader edges among them. A category whose page is missing from the dump is
 kept without parents. A category that is a redirect is followed once, and its target is the concept. Maintenance
 categories (MAINTENANCE, and any name with "stub" or "articles needing") are dropped. A cycle is broken: the
 broader edge that closes it is dropped and counted.
@@ -144,11 +145,12 @@ def read_categories(source: DumpSource, names: list[str]) -> dict[str, dict]:
 
 
 def walk(source: DumpSource, doc_cats: set[str], depth: int) -> tuple[dict[str, dict], dict[str, int]]:
-    """Read the pages of the categories up to depth levels from the documents. Returns (entries by name as
-    read_categories gives them, the distance from the documents of each name seen)."""
+    """Read the pages of the categories depth levels above the documents' own. The documents' categories are always
+    read (to follow their redirects) even at depth 0, but only levels below depth add parents. Returns (entries by
+    name as read_categories gives them, the distance from the documents of each name seen)."""
     dist = {n: 0 for n in doc_cats}
     entries: dict[str, dict] = {}
-    for d in range(depth):
+    for d in range(max(depth, 1)):
         layer = sorted(n for n, k in dist.items() if k == d and n not in entries)
         if not layer:
             break
@@ -158,9 +160,10 @@ def walk(source: DumpSource, doc_cats: set[str], depth: int) -> tuple[dict[str, 
             e = entries[n]
             if e["canon"] != n:
                 dist.setdefault(e["canon"], d)
-            for p in e["parents"]:
-                if p not in dist and not is_maintenance(p):
-                    dist[p] = d + 1
+            if d < depth:
+                for p in e["parents"]:
+                    if p not in dist and not is_maintenance(p):
+                        dist[p] = d + 1
     return entries, dist
 
 
@@ -261,7 +264,7 @@ def main(argv=None):
     report = {
         "documents": len(docs),
         "concepts": len(built["nodes"]),
-        "concepts_per_level": dict(sorted(Counter(built["level"].values()).items())),
+        "concepts_per_distance": dict(sorted(Counter(built["level"].values()).items())),
         "broader_edges": sum(len(v) for v in built["parents"].values()),
         "cycles_broken": built["cycles"],
         "missing_pages": built["missing_pages"],
