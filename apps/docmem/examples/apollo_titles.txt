@@ -1,0 +1,48 @@
+# Apollo 11 prose knowledge base: English Wikipedia articles, one "Title|group" per line.
+Apollo 11|mission
+Apollo program|mission
+Moon landing|mission
+Moon|mission
+Space Race|mission
+Human spaceflight|mission
+Apollo 11 goodwill messages|mission
+Saturn V|vehicle
+S-IC|vehicle
+S-II|vehicle
+S-IVB|vehicle
+Saturn IB|vehicle
+Apollo command and service module|vehicle
+Apollo Lunar Module|vehicle
+Lunar Module Eagle|vehicle
+Command module|vehicle
+Rocketdyne F-1|subsystem
+Rocketdyne J-2|subsystem
+Descent propulsion system|subsystem
+Ascent propulsion system|subsystem
+Apollo Guidance Computer|subsystem
+Apollo PGNCS|subsystem
+Apollo Abort Guidance System|subsystem
+Apollo TV camera|subsystem
+Apollo Lunar Surface Experiments Package|subsystem
+Apollo/Skylab spacesuit|subsystem
+Primary life support system|subsystem
+Lunar Roving Vehicle|subsystem
+Mission control center|operations
+Kennedy Space Center Launch Complex 39|operations
+Manned Space Flight Network|operations
+Lunar orbit rendezvous|operations
+Trans-lunar injection|operations
+Tranquility Base|operations
+Lunar Laser Ranging experiments|operations
+Moon rock|operations
+Neil Armstrong|people
+Buzz Aldrin|people
+Michael Collins (astronaut)|people
+Jim Lovell|people
+Apollo 1|related
+Apollo 8|related
+Apollo 10|related
+Apollo 12|related
+Apollo 13|related
+Project Mercury|related
+Project Gemini|related
