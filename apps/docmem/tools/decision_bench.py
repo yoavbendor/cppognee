@@ -17,7 +17,7 @@ Each task is a plug-in in TASKS. Its build() returns items; the same run() and s
     python tools/decision_bench.py --task routing --build --run --score [--limit N]
     python tools/decision_bench.py --summary          # rebuild summary.md from the reports
 
-Outputs under $DBENCH_SCRATCH/dbench (default: the session scratchpad):
+Outputs under $DBENCH_SCRATCH/dbench (default: ./dbench_work/dbench):
     <task>/items.jsonl, <task>/preds.jsonl, <task>/report.json, summary.md, cache.jsonl (decider cache)
 
 DB content is read in child processes, one per DB, because docmem.store.configure must run before cognee is
@@ -41,8 +41,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DOCMEM = HERE.parent
-SCRATCH = Path(os.environ.get(
-    "DBENCH_SCRATCH", "/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad"))
+# Where outputs go (and, for --build, where the source DBs are): $DBENCH_SCRATCH, else ./dbench_work.
+SCRATCH = Path(os.environ.get("DBENCH_SCRATCH", Path.cwd() / "dbench_work"))
 BENCH = SCRATCH / "dbench"
 WORK = BENCH / "_work"
 CACHE = BENCH / "cache.jsonl"

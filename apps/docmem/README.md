@@ -1,5 +1,7 @@
 # docmem
 
+> At work: see [WORK.md](WORK.md) to set up from a fresh clone and run the decision-model evaluation.
+
 Index local documents into **cognee on nanolance**, keeping only vectors and provenance, never the text.
 Questions are answered by reading the cited byte ranges back from the files. Your OpenAI-compatible
 server writes the answers.
