@@ -75,6 +75,7 @@ async def run(a):
                "stale_hits": sum(h["status"] != "ok" for h in hits), "timing": r["timing"],
                "seconds": round(time.time() - t, 2), "searches": r["searches"], "calls": r["calls"],
                "linked": r["linked"], "pivot_concepts": r["pivot_concepts"],
+               "link_weights": [{"label": ask.label(h), **h["weights"]} for h in hits if "weights" in h],
                "aligned_found_by": dict(Counter(h["found_by"] for h in hits if h.get("found_by"))),
                "hits": [ask.label(h) for h in hits]}
         if chat:

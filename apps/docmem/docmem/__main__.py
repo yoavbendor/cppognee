@@ -23,6 +23,7 @@ USAGE = """usage: docmem <command> ...
   classify   link documents and sections to their nearest concepts by stored vectors (no LLM)
   concepts   a document's concepts with scores, or the top levels of the concept tree
   wiki-categories  the Wikipedia category tree of the indexed articles as a SKOS file (dump read, no LLM)
+  decide-check  send one request to a decision model (DOCMEM_DECIDER_*) and print the parsed and raw answer
 """
 
 
@@ -71,6 +72,8 @@ def main():
         from .ontology import concepts_main as m
     elif cmd == "wiki-categories":
         from .wiki_categories import main as m
+    elif cmd == "decide-check":
+        from .decide import check_main as m
     else:
         raise SystemExit(USAGE)
     m(argv)

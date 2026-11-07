@@ -8,6 +8,7 @@ answer from them, citing file and line.
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 import time
@@ -65,18 +66,27 @@ def span(h, offset, length, sha256=None):
                              doc_sha256=h["doc_sha256"] or None, title=h["path"].split(" › ")[0])
 
 
+OWN_SUFFIX = " (its article)"  # a target's name when it is the document the passage belongs to
+LEAD_BONUS = 1.5  # --link-weights det: a linking passage in its document's lead section
+OWN_BONUS = 1.5   # --link-weights det: a passage of the target's own article
+
+
 async def link_neighbours(graph, passage_ids: list[str]):
     """Passages one link away from the given ones, with no LLM: through every target they link to
     (wiki title, URL, file, ID), the other passages linking to that target and the passages of the
-    document that is the target. {passage id: [target name, ...]} and {target name: in-degree}."""
+    document that is the target. Returns {passage id: [target name, ...]}, {target name: in-degree}
+    (passages linking to it) and {target name: support} (distinct given passages linking to it)."""
     if not passage_ids:
-        return {}, {}
+        return {}, {}, {}
     rows = await graph.query(
         "MATCH (p:Node)-[r:EDGE]->(t:Node) WHERE p.id IN $ids AND r.relationship_name = 'links_to' "
-        "RETURN DISTINCT t.id, t.name", {"ids": passage_ids})
-    targets = {tid: name for tid, name in rows}
+        "RETURN p.id, t.id, t.name", {"ids": passage_ids})
+    targets = {tid: name for _, tid, name in rows}
     if not targets:
-        return {}, {}
+        return {}, {}, {}
+    support = {}
+    for pid, _, name in rows:
+        support.setdefault(name, set()).add(pid)
     tids = list(targets)
     via, degree = {}, {}
     # other passages linking to the same targets
@@ -93,7 +103,7 @@ async def link_neighbours(graph, passage_ids: list[str]):
         via.setdefault(pid, []).append(targets[tid] + " (its article)")
     for pid in passage_ids:
         via.pop(pid, None)
-    return via, degree
+    return via, degree, {name: len(pids) for name, pids in support.items()}
 
 
 async def hits_for(ids, distance: dict):
@@ -111,16 +121,21 @@ async def hits_for(ids, distance: dict):
     return out
 
 
-async def best_of(question: str, cands, n: int):
-    """The n candidate passages nearest the question, by their stored vectors (no re-embedding)."""
+async def distances(question: str, cands) -> dict[str, float]:
+    """Cosine distance from the question to each candidate passage's stored vector (no re-embedding)."""
     import numpy as np
 
     _, vector = await store.engines()
     rows = await vector.retrieve(store.PASSAGES, list(cands), include_vector=True)
     q = np.asarray((await vector.embedding_engine.embed_text([question]))[0], dtype=np.float32)
     q /= np.linalg.norm(q) or 1
-    scored = sorted((1 - float(q @ (v := np.asarray(r.payload["vector"], dtype=np.float32)) /
-                               (np.linalg.norm(v) or 1)), str(r.id)) for r in rows)[:n]
+    return {str(r.id): 1 - float(q @ (v := np.asarray(r.payload["vector"], dtype=np.float32)) /
+                                 (np.linalg.norm(v) or 1)) for r in rows}
+
+
+async def best_of(question: str, cands, n: int):
+    """The n candidate passages nearest the question, by their stored vectors (no re-embedding)."""
+    scored = sorted((d, pid) for pid, d in (await distances(question, cands)).items())[:n]
     return await hits_for([pid for _, pid in scored], {pid: round(d, 4) for d, pid in scored})
 
 
@@ -169,19 +184,76 @@ async def expand_terms(question: str, hits, n: int, db, terms: int = 8):
     return out, [h["via"] for h in added]
 
 
-async def expand_links(question: str, hits, n: int, max_degree: int):
-    """Add up to n passages reached through links from the hits, ranked by the question's similarity to
-    their stored vectors. Targets linked from more than max_degree passages (e.g. a country) are too
-    common to say anything and are not followed."""
+def weigh_links(cands: dict[str, list[str]], sims: dict[str, float], idf: dict[str, float],
+                support: dict[str, int], lead: dict[str, bool], lam: float) -> dict[str, dict]:
+    """--link-weights det: each candidate's link score (the sum over the targets reaching it of idf x support x
+    lead, the own-article bonus for a target's own article), normalized by the best candidate's, and its final
+    rank lam x normalized link score + (1 - lam) x similarity. cands: {passage: [target name]} (not common)."""
+    records = {}
+    for pid, ts in cands.items():
+        lead_f = LEAD_BONUS if lead[pid] else 1.0
+        comps = []
+        for t in ts:
+            own = t.endswith(OWN_SUFFIX)
+            base = t[:-len(OWN_SUFFIX)] if own else t
+            w = idf[base] * support[base] * lead_f * (OWN_BONUS if own else 1.0)
+            comps.append({"target": t, "idf": round(idf[base], 4), "support": support[base], "lead": lead_f,
+                          "own": own, "contribution": round(w, 4), "_w": w})
+        records[pid] = {"link_score": sum(c["_w"] for c in comps), "targets": comps}
+    best = max((r["link_score"] for r in records.values()), default=0.0)
+    for pid, r in records.items():
+        for c in r["targets"]:
+            del c["_w"]
+        norm = r["link_score"] / best if best > 0 else 0.0
+        r.update({"link_score": round(r["link_score"], 4), "norm_link": round(norm, 4),
+                  "similarity": round(sims[pid], 4), "lead": lead[pid],
+                  "final": round(lam * norm + (1 - lam) * sims[pid], 4)})
+    return records
+
+
+async def det_links(question: str, cands: dict[str, list[str]], degree: dict[str, int], support: dict[str, int],
+                    n: int, lam: float):
+    """The n candidates with the best final rank (weigh_links), each with its weight components."""
     graph, _ = await store.engines()
-    via, degree = await link_neighbours(graph, [h["id"] for h in hits])
+    total = (await graph.query("MATCH (p:Node) WHERE p.type = 'DocPassage' RETURN count(p)", {}))[0][0]
+    dist = await distances(question, cands)
+    cands = {pid: ts for pid, ts in cands.items() if pid in dist}
+    if not cands:
+        return []
+    nodes = {nd["id"]: store.node_props(nd) for nd in await graph.get_nodes(list(cands))}
+    lead = {pid: " › " not in nodes[pid]["path"] for pid in cands}
+    idf = {}
+    for ts in cands.values():
+        for t in ts:
+            base = t[:-len(OWN_SUFFIX)] if t.endswith(OWN_SUFFIX) else t
+            idf[base] = math.log(total / (1 + degree[base]))
+    records = weigh_links(cands, {pid: 1 - dist[pid] for pid in cands}, idf, support, lead, lam)
+    top = sorted(records, key=lambda pid: (-records[pid]["final"], pid))[:n]
+    added = await hits_for(top, {pid: round(dist[pid], 4) for pid in top})
+    for h in added:
+        h["weights"] = records[h["id"]]
+        h["via"] = cands[h["id"]]
+    return added
+
+
+async def expand_links(question: str, hits, n: int, max_degree: int, weights: str = "none", lam: float = 0.5):
+    """Add up to n passages reached through links from the hits. Targets linked from more than max_degree
+    passages (e.g. a country) are too common to say anything and are not followed. Ranked by the question's
+    similarity to their stored vectors (weights none), or by the deterministic link weights (weights det,
+    see weigh_links)."""
+    graph, _ = await store.engines()
+    via, degree, support = await link_neighbours(graph, [h["id"] for h in hits])
     common = {t for t, d in degree.items() if d > max_degree}
-    cands = {pid: ts for pid, ts in via.items() if any(t not in common for t in ts)}
+    cands = {pid: [t for t in ts if t not in common] for pid, ts in via.items()}
+    cands = {pid: ts for pid, ts in cands.items() if ts}
     if not cands:
         return hits, []
-    added = await best_of(question, cands, n)
-    for h in added:
-        h["via"] = [t for t in cands[h["id"]] if t not in common]
+    if weights == "det":
+        added = await det_links(question, cands, degree, support, n, lam)
+    else:
+        added = await best_of(question, cands, n)
+        for h in added:
+            h["via"] = cands[h["id"]]
     out = hits + added
     for i, h in enumerate(out, 1):
         h["rank"] = i
@@ -494,7 +566,8 @@ async def ask_one(question: str, a, chat):
         timing["concepts_ms"] = round((time.time() - t) * 1000, 1)
     if a.links:
         t = time.time()
-        hits, by_links = await expand_links(question, hits, a.links, a.link_max_degree)
+        hits, by_links = await expand_links(question, hits, a.links, a.link_max_degree, a.link_weights,
+                                            a.link_lambda)
         linked += by_links
         timing["links_ms"] = round((time.time() - t) * 1000, 1)
     hits = read_hits(hits, a.context, a.max_bytes)
@@ -558,6 +631,12 @@ def add_common(ap):
                          "linked document itself), ranked by similarity; no LLM; 0 = off")
     ap.add_argument("--link-max-degree", type=int, default=50,
                     help="do not follow targets linked from more passages than this (too common)")
+    ap.add_argument("--link-weights", choices=("none", "det"), default="none",
+                    help="--links ranking: none = the question's similarity; det = deterministic link weights "
+                         "(idf of the target, support from the hits, lead section, own article) mixed with the "
+                         "similarity by --link-lambda; no LLM")
+    ap.add_argument("--link-lambda", type=float, default=0.5,
+                    help="--link-weights det: weight of the link score against the similarity (0 to 1)")
     ap.add_argument("--concepts", type=int, default=0, metavar="N",
                     help="add up to N passages of other documents sharing a concept (level 2 or deeper, from "
                          "docmem classify) with the hits' documents, ranked by similarity; no LLM; 0 = off")
@@ -595,6 +674,8 @@ def add_common(ap):
 def open_db(a):
     if a.hops < 0 or a.hop_k < 1 or a.max_passages < 1:
         raise SystemExit("docmem: --hops must be 0 or more; --hop-k and --max-passages at least 1")
+    if not 0 <= a.link_lambda <= 1:
+        raise SystemExit("docmem: --link-lambda must be between 0 and 1")
     if a.pivot < 0 or a.pivot_concepts < 1:
         raise SystemExit("docmem: --pivot must be 0 or more; --pivot-concepts at least 1")
     if a.with_model and not a.model_db:

@@ -306,6 +306,28 @@ docmem model-gaps  --db $MODEL --check UnverifiedRequirements --under TechnicalR
 - **Model checks** run nomograph's `check all --detail` on the export. Each finding is a `ModelFinding` node with an
   `about` edge to its element's section. A re-run replaces them. `model-gaps` lists them.
 
+## Decision models (Microsoft Decision-1 / Kev)
+
+`docmem/decide.py` is a small client for System One-style decision models: one request per state, with many
+questions (yes/no probability, a choice distribution, or a score). Answers are cached in a JSONL file, keyed by a hash
+of model, state and question; the state text is never written.
+
+```sh
+export DOCMEM_DECIDER_URL=https://your-resource.cognitiveservices.azure.com   # or http://localhost:8080 for Kev
+export DOCMEM_DECIDER_KEY=...           # the api-key (Kev: optional, sent as "local")
+export DOCMEM_DECIDER_MODEL=your-deployment                                   # or the Kev model
+docmem decide-check                     # one request: prints the parsed answer and the raw JSON
+```
+
+- **Flavor:** `DOCMEM_DECIDER_FLAVOR=foundry|kev`; by default `foundry` when the URL names Azure, else `kev`.
+- **Entra:** `DOCMEM_DECIDER_AUTH=entra` (foundry) sends a token from `azure-identity` (`pip install azure-identity`).
+- **Flags:** `docmem decide-check --url --key --model --flavor --auth --type noul|choice|score`; a flag overrides its variable.
+- **Foundry field names are not documented.** The parser tries `probability`, `noul`, `p`, `value` for a yes/no
+  probability, `probabilities` or `distribution` for a choice, `score` or `mean` for a score, and says on stderr which
+  fields the first answer had. Run `decide-check` once and pin the names in `decide.py` if they differ.
+- **Python:** `Decider.from_env(cache=Path("kb/decider_cache.jsonl")).decide(state, {"safe": {"type": "noul", "instructions": "Is it safe?"}})`
+  returns `{name: Decision}` with `p_yes`, `probabilities`, `score`, `choice`, `confidence` and `raw`.
+
 ## What changed in cognee (this fork)
 
 1. **`DataPoint.metadata["store_index_text"] = False`** (LanceDB adapter): the index field is embedded, and the vector
