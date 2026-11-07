@@ -67,7 +67,7 @@ async def run(a):
                "first_rank": min(found) if found else None, "sources_found": f"{len(found)}/{len(ranks)}",
                "stale_hits": sum(h["status"] != "ok" for h in hits), "timing": r["timing"],
                "seconds": round(time.time() - t, 2), "searches": r["searches"], "calls": r["calls"],
-               "linked": r["linked"],
+               "linked": r["linked"], "pivot_concepts": r["pivot_concepts"],
                "hits": [ask.label(h) for h in hits]}
         if chat:
             ans = r["answer"]
@@ -90,13 +90,15 @@ async def run(a):
 def summarize(rows, a, usage):
     ans = [r for r in rows if r["answerable"]]
     s = {"questions": len(rows), "answerable": len(ans), "k": a.k, "context": a.context, "rerank": a.rerank,
-         "hops": a.hops, "links": a.links, "terms": a.terms, "concepts": a.concepts}
+         "hops": a.hops, "links": a.links, "terms": a.terms, "concepts": a.concepts, "pivot": a.pivot}
     if a.hops:
         s.update({"hop_k": a.hop_k, "max_passages": a.max_passages})
+    if a.pivot:
+        s.update({"pivot_scheme": a.pivot_scheme or "all", "pivot_concepts_per_question": a.pivot_concepts})
     for k in sorted({1, 3, a.k}):
         s[f"hit@{k}"] = round(sum(1 for r in ans if r["first_rank"] and r["first_rank"] <= k) / max(len(ans), 1), 3)
     s["mrr"] = round(sum(1 / r["first_rank"] for r in ans if r["first_rank"]) / max(len(ans), 1), 3)
-    gathered = ("all sources gathered" if (a.hops or a.links or a.terms or a.concepts)
+    gathered = ("all sources gathered" if (a.hops or a.links or a.terms or a.split or a.concepts or a.pivot)
                 else f"all sources in top {a.k}")
     for kind in sorted({r["kind"] for r in ans}):
         rs = [r for r in ans if r["kind"] == kind]

@@ -156,6 +156,13 @@ docmem ask --db ~/kb --concepts 3 "question"      # add passages of documents sh
 - `--concepts N` (on `ask` and `eval`) follows only concepts at level 2 or deeper; broad ones like "sport" are not
   followed.
 
+**Pivot retrieval** (`--pivot N`, on `ask` and `eval`, no LLM) retrieves through a shared idea instead of outward
+from the top passages. The concepts the question names (a label occurs in it as whole words, e.g. "viscosity") are
+taken first, then the `--pivot-concepts C` (default 2) concepts nearest the question's vector. Passages of the
+documents or sections about those concepts are ranked by similarity, and the best passage of each of up to N
+documents is added. `--pivot-scheme` limits it to one scheme; `eval` reports the chosen concepts per question as
+`pivot_concepts`.
+
 ## Wikipedia samples by topic and their category concepts
 
 `docmem scan-wiki --seed-pages FILE` samples the articles that seed pages link to, not random articles. FILE has one

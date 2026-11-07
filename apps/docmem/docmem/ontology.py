@@ -18,6 +18,7 @@ Nothing here calls an LLM or reads a source file: only the graph and the stored 
 import argparse
 import asyncio
 import json
+import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -156,6 +157,25 @@ def top_k(row: np.ndarray, k: int, min_sim: float) -> list[int]:
     return [int(i) for i in order if row[i] >= min_sim]
 
 
+def label_matches(text: str, labels: dict[str, str]) -> list[str]:
+    """Ids of the concepts whose label occurs in text, as whole words (case-insensitive), longest label first.
+    "ohm" does not match "Bohmian". A match may not overlap a longer one already taken, so "Hall effect"
+    takes its words away from a concept named "effect"; each concept is returned at most once."""
+    lowered = text.lower()
+    taken = [False] * len(lowered)
+    out = []
+    for cid, label in sorted(labels.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        needle = label.strip().lower()
+        if not needle:
+            continue
+        for m in re.finditer(rf"(?<!\w){re.escape(needle)}(?!\w)", lowered):
+            if not any(taken[m.start():m.end()]):
+                taken[m.start():m.end()] = [True] * (m.end() - m.start())
+                out.append(cid)
+                break
+    return out
+
+
 # ---- the cognee side -------------------------------------------------------------------------------
 
 _model = None
@@ -257,6 +277,28 @@ async def passages_of_docs(graph, doc_ids: list[str]) -> dict[str, list[str]]:
         "RETURN p.id, f.id", {"ids": doc_ids})
     for p, f in rows:
         out[str(f)].append(str(p))
+    return out
+
+
+async def sections_with_concepts(graph, concept_ids: list[str]) -> dict[str, list[str]]:
+    """concept id -> ids of the DocSections that are about it (about_concept edges from sections)."""
+    out: dict[str, list[str]] = defaultdict(list)
+    if concept_ids:
+        for sid, cid in await graph.query(
+                "MATCH (s:Node)-[r:EDGE]->(c:Node) WHERE c.id IN $cids AND r.relationship_name = $rel "
+                "AND s.type = 'DocSection' RETURN s.id, c.id", {"cids": concept_ids, "rel": ABOUT}):
+            out[str(cid)].append(str(sid))
+    return out
+
+
+async def passages_of_sections(graph, section_ids: list[str]) -> dict[str, list[str]]:
+    """DocSection id -> its passage ids."""
+    out: dict[str, list[str]] = defaultdict(list)
+    if section_ids:
+        for p, s in await graph.query(
+                "MATCH (p:Node)-[r:EDGE]->(s:Node) WHERE s.id IN $ids AND r.relationship_name = 'section' "
+                "AND p.type = 'DocPassage' RETURN p.id, s.id", {"ids": section_ids}):
+            out[str(s)].append(str(p))
     return out
 
 

@@ -160,3 +160,53 @@ def test_top_k_picks_best_first_and_applies_min_sim():
     assert top_k(row, 3, 0.6) == [1, 3]  # 0.5 is below the minimum
     assert top_k(row, 4, 0.95) == []
     assert top_k(row, 10, -1.0) == [1, 3, 2, 0]
+
+
+def test_label_matches_whole_words_only():
+    from docmem.ontology import label_matches
+
+    assert label_matches("What is Bohmian mechanics?", {"ohm": "Ohm"}) == []  # inside a word
+    assert label_matches("Ohm's law and a Bohmian view", {"ohm": "Ohm", "bo": "Bohmian"}) == ["bo", "ohm"]
+    assert label_matches("the ohm-metre", {"ohm": "Ohm"}) == ["ohm"]  # a hyphen ends a word
+
+
+def test_label_matches_is_case_insensitive_and_once_per_concept():
+    from docmem.ontology import label_matches
+
+    assert label_matches("VISCOSITY, viscosity and more viscosity", {"v": "Viscosity"}) == ["v"]
+
+
+def test_label_matches_longest_first_and_no_overlap():
+    from docmem.ontology import label_matches
+
+    labels = {"effect": "effect", "hall": "Hall effect", "ohm": "Ohm"}
+    # "Hall effect" is taken first, so "effect" inside it does not match; the result is longest first
+    assert label_matches("Ohm and the Hall effect", labels) == ["hall", "ohm"]
+    assert label_matches("only the effect here", labels) == ["effect"]
+    assert label_matches("motor oil", {"oil": "oil", "mo": "motor oil"}) == ["mo"]
+
+
+def test_label_matches_skips_empty_labels():
+    from docmem.ontology import label_matches
+
+    assert label_matches("anything at all", {"x": "  "}) == []
+
+
+def test_best_per_document_keeps_best_passage_then_top_documents():
+    from docmem.ask import best_per_document
+
+    ranked = [  # best first
+        {"id": "a1", "uri": "A"}, {"id": "a2", "uri": "A"}, {"id": "b1", "uri": "B"},
+        {"id": "c1", "uri": "C"}, {"id": "b2", "uri": "B"}, {"id": "d1", "uri": "D"},
+    ]
+    assert [h["id"] for h in best_per_document(ranked, 2)] == ["a1", "b1"]
+    assert [h["id"] for h in best_per_document(ranked, 3)] == ["a1", "b1", "c1"]
+    assert [h["id"] for h in best_per_document(ranked, 10)] == ["a1", "b1", "c1", "d1"]
+
+
+def test_best_per_document_one_document_gives_one_passage():
+    from docmem.ask import best_per_document
+
+    ranked = [{"id": "x1", "uri": "X"}, {"id": "x2", "uri": "X"}]
+    assert [h["id"] for h in best_per_document(ranked, 3)] == ["x1"]
+    assert best_per_document([], 3) == []

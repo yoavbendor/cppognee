@@ -224,6 +224,124 @@ async def expand_concepts(question: str, hits, n: int, scheme: str | None = None
     return out, [h["via"] for h in added]
 
 
+def best_per_document(ranked: list[dict], n: int) -> list[dict]:
+    """ranked is best first. Keep each document's best passage, then the n best documents' passages, in order."""
+    seen, firsts = set(), []
+    for h in ranked:
+        if h["uri"] not in seen:
+            seen.add(h["uri"])
+            firsts.append(h)
+    return firsts[:n]
+
+
+async def pivot_concepts(question: str, scheme: str | None, n: int) -> list[tuple[str, str]]:
+    """The concepts the question names, as (id, label): those whose label occurs in it (any level, longest
+    first), then the n nearest to the question's vector among concepts at level 1 or deeper. No LLM."""
+    from . import ontology
+
+    graph, vector = await store.engines()
+    nodes = await ontology.nodes_of_type(graph, "DocConcept")
+    if scheme is not None:
+        if scheme not in {x.get("scheme") for x in nodes}:
+            raise SystemExit(f"docmem ask --pivot-scheme: no scheme {scheme!r} in this index")
+        nodes = [x for x in nodes if x.get("scheme") == scheme]
+    if not nodes:
+        raise SystemExit("docmem ask --pivot: this index has no ontology (run docmem ontology load first)")
+    names = {x["id"]: x["name"] for x in nodes}
+    level = {x["id"]: x.get("level", 0) for x in nodes}
+    named = ontology.label_matches(question, names)
+    qv = (await vector.embedding_engine.embed_text([question]))[0]
+    found = sorted(await vector.search(ontology.CONCEPTS, query_text=None, query_vector=list(qv), limit=50),
+                   key=lambda r: float(r.score))
+    nearest = [str(r.id) for r in found if str(r.id) in names and level[str(r.id)] >= 1][:n]
+    return [(cid, names[cid]) for cid in named + [c for c in nearest if c not in named]]
+
+
+def question_parts(question: str) -> list[str]:
+    """The parts of a question naming several subjects ("A, B and C"): split at commas, "and", "or";
+    [] when that gives fewer than two parts."""
+    import re
+
+    parts = [p.strip(" ?.") for p in re.split(r",|\band\b|\bor\b", question) if p.strip(" ?.")]
+    return parts if len(parts) >= 2 else []
+
+
+async def expand_parts(question: str, hits, per_part: int):
+    """Retrieve for each named subject separately and add its best passages (no LLM)."""
+    have = {h["id"] for h in hits}
+    added = []
+    for part in question_parts(question):
+        found, _ = await retrieve(part, per_part)
+        for h in found:
+            if h["id"] not in have:
+                have.add(h["id"])
+                h["via"] = [f"part: {part}"]
+                added.append(h)
+    out = hits + added
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, [h["via"] for h in added]
+
+
+async def concept_passages(cids: list[str], labels: dict, db, per_concept: int = 30) -> dict[str, list[str]]:
+    """{concept id: passage ids} found by searching the passages WITH the concept: its own stored vector
+    (label + definition) as the query, and its label as a keyword (BM25) query when the index has one.
+    This reaches passages that discuss the concept although their document's top concepts are others."""
+    from pathlib import Path
+
+    _, vector = await store.engines()
+    out = {}
+    rows = await vector.retrieve("DocConcept_embed_text", cids, include_vector=True)
+    for r in rows:
+        found = await vector.search(store.PASSAGES, query_vector=r.payload["vector"], limit=per_concept)
+        out[str(r.id)] = [str(x.id) for x in found]
+    if (Path(db) / "system" / "databases" / "docmem_keywords.lancedb").exists():
+        from .keywords import KeywordIndex
+
+        kw = KeywordIndex(Path(db))
+        for cid in cids:
+            out.setdefault(cid, []).extend(pid for pid, _ in kw.search(labels[cid], per_concept))
+    return out
+
+
+async def expand_pivot(question: str, hits, n: int, scheme: str | None, concepts: int, db=None):
+    """Retrieve through a concept: passages of the documents (or their sections) about a concept the question
+    names, the best passage of each of up to n documents by the question's similarity to their stored vectors.
+    Returns (hits, linked, the chosen concepts as (id, label))."""
+    from . import ontology
+
+    graph, _ = await store.engines()
+    picks = await pivot_concepts(question, scheme, concepts)
+    labels = dict(picks)
+    cids = list(labels)
+    if not cids:
+        return hits, [], picks
+    have = {h["id"] for h in hits}
+    docs = await ontology.docs_with_concepts(graph, cids)
+    secs = await ontology.sections_with_concepts(graph, cids)
+    by_doc = await ontology.passages_of_docs(graph, sorted({f for fs in docs.values() for f in fs}))
+    by_sec = await ontology.passages_of_sections(graph, sorted({s for ss in secs.values() for s in ss}))
+    searched = await concept_passages(cids, labels, db) if db else {}
+    cands: dict[str, list[str]] = {}  # passage id -> the labels of the concepts that reach it
+    for cid in cids:
+        pids = [p for f in docs.get(cid, []) for p in by_doc.get(f, [])] + \
+               [p for s in secs.get(cid, []) for p in by_sec.get(s, [])] + searched.get(cid, [])
+        for pid in pids:
+            if pid not in have:
+                tags = cands.setdefault(pid, [])
+                if f"pivot: {labels[cid]}" not in tags:
+                    tags.append(f"pivot: {labels[cid]}")
+    if not cands:
+        return hits, [], picks
+    added = best_per_document(await best_of(question, cands, len(cands)), n)
+    for h in added:
+        h["via"] = cands[h["id"]]
+    out = hits + added
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, [h["via"] for h in added], picks
+
+
 async def link_notes(hits) -> list[str]:
     """Sentences naming how the excerpts are linked, from the link graph (no LLM): excerpts of different
     documents that link to the same target, and an excerpt linking to the document another one is from."""
@@ -350,6 +468,18 @@ async def ask_one(question: str, a, chat):
     else:
         hits, timing = await retrieve(question, a.k, a.rerank or a.k)
     linked = []
+    pivots = []
+    if a.split:
+        t = time.time()
+        hits, by_parts = await expand_parts(question, hits, a.split)
+        linked += by_parts
+        timing["split_ms"] = round((time.time() - t) * 1000, 1)
+    if a.pivot:
+        t = time.time()
+        hits, by_pivot, picks = await expand_pivot(question, hits, a.pivot, a.pivot_scheme, a.pivot_concepts, a.db)
+        linked += by_pivot
+        pivots = [label for _, label in picks]
+        timing["pivot_ms"] = round((time.time() - t) * 1000, 1)
     if a.terms:
         t = time.time()
         hits, by_terms = await expand_terms(question, hits, a.terms, a.db)
@@ -391,7 +521,7 @@ async def ask_one(question: str, a, chat):
         timing["answer_s"] = round(time.time() - t, 2)
     calls = chat.usage["calls"] - before if chat else 0
     return {"question": question, "answer": text, "hits": hits, "timing": timing,
-            "searches": searches, "calls": calls, "linked": linked}
+            "searches": searches, "calls": calls, "linked": linked, "pivot_concepts": pivots}
 
 
 def add_common(ap):
@@ -406,6 +536,9 @@ def add_common(ap):
                     help="give the model each hit's passage, or its whole enclosing section")
     ap.add_argument("--max-bytes", type=int, default=6000, help="cut a section read at this many bytes")
     ap.add_argument("--no-answer", action="store_true", help="retrieval only; no chat model needed")
+    ap.add_argument("--split", type=int, default=0, metavar="N",
+                    help="for a question naming several subjects (A, B and C), also retrieve N passages for "
+                         "each part separately; no LLM; 0 = off")
     ap.add_argument("--keywords", action="store_true",
                     help="hybrid retrieval: fuse vector and keyword (BM25) results by reciprocal rank")
     ap.add_argument("--terms", type=int, default=0, metavar="N",
@@ -419,6 +552,13 @@ def add_common(ap):
                     help="add up to N passages of other documents sharing a concept (level 2 or deeper, from "
                          "docmem classify) with the hits' documents, ranked by similarity; no LLM; 0 = off")
     ap.add_argument("--concept-scheme", help="--concepts follows only this scheme's concepts (default: all)")
+    ap.add_argument("--pivot", type=int, default=0, metavar="N",
+                    help="retrieve through a concept: the concepts the question names (by label, or nearest by "
+                         "vector), then the best passage of each of up to N documents about them (document or "
+                         "section level); no LLM; 0 = off")
+    ap.add_argument("--pivot-scheme", help="--pivot uses only this scheme's concepts (default: all)")
+    ap.add_argument("--pivot-concepts", type=int, default=2, metavar="C",
+                    help="--pivot takes the C concepts nearest the question by vector, besides those it names")
     ap.add_argument("--link-notes", action="store_true",
                     help="tell the model how the excerpts are linked (shared link targets), from the graph")
     ap.add_argument("--hops", type=int, default=0, metavar="N",
@@ -432,6 +572,8 @@ def add_common(ap):
 def open_db(a):
     if a.hops < 0 or a.hop_k < 1 or a.max_passages < 1:
         raise SystemExit("docmem: --hops must be 0 or more; --hop-k and --max-passages at least 1")
+    if a.pivot < 0 or a.pivot_concepts < 1:
+        raise SystemExit("docmem: --pivot must be 0 or more; --pivot-concepts at least 1")
     store.configure(a.db, api_base=a.api_base or os.environ.get("DOCMEM_API_BASE"),
                     api_key=a.api_key or os.environ.get("DOCMEM_API_KEY"))
     from .llm import Chat
