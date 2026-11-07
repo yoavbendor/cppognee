@@ -267,6 +267,8 @@ class Decider:
         self.timeout = timeout
         self._sleep = sleep
         self._cache = _read_cache(cache) if cache else {}
+        # requests sent, decisions answered from the cache, and seconds spent waiting for the server
+        self.stats = {"requests": 0, "cache_hits": 0, "seconds": 0.0}
 
     @classmethod
     def from_env(cls, cache: Path | None = None, env=None, **flags) -> "Decider":
@@ -307,11 +309,16 @@ class Decider:
         norm = {n: _normalize(n, q) for n, q in questions.items()}
         keys = {n: cache_key(self.cfg.model, state, q) for n, q in norm.items()}
         out = {n: Decision(n, **self._cache[keys[n]]) for n in norm if keys[n] in self._cache}
+        self.stats["cache_hits"] += len(out)
         todo = {n: norm[n] for n in norm if n not in out}
         names = list(todo)
         for i in range(0, len(names), self.max_questions):
             chunk = {n: todo[n] for n in names[i:i + self.max_questions]}
-            for n, d in self.parse(self.ask(state, chunk), chunk).items():
+            t = time.perf_counter()
+            resp = self.ask(state, chunk)
+            self.stats["seconds"] += time.perf_counter() - t
+            self.stats["requests"] += 1
+            for n, d in self.parse(resp, chunk).items():
                 out[n] = d
                 self._store(keys[n], d)
         return {n: out[n] for n in questions}

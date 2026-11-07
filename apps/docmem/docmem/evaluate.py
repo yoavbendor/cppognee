@@ -102,6 +102,13 @@ def summarize(rows, a, usage):
          "hops": a.hops, "links": a.links, "terms": a.terms, "concepts": a.concepts, "pivot": a.pivot}
     if a.hops:
         s.update({"hop_k": a.hop_k, "max_passages": a.max_passages})
+    if a.links and a.link_weights != "none":
+        s.update({"link_weights": a.link_weights, "link_lambda": a.link_lambda})
+    if a.link_weights == "decide":
+        dec = [r["timing"]["decide"] for r in rows if "decide" in r["timing"]]
+        s.update({"decider_requests": sum(d["requests"] for d in dec),
+                  "decider_cache_hits": sum(d["cache_hits"] for d in dec),
+                  "decider_seconds": round(sum(d["seconds"] for d in dec), 1)})
     if a.with_model or a.with_prose:
         s.update({"with_model": str(a.with_model or ""), "with_prose": str(a.with_prose or ""), "aligned": a.aligned})
     if a.pivot:

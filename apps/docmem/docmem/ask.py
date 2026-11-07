@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from . import store
+from .decide import DeciderError, DeciderResponseError
 
 ANSWER_SYSTEM = (
     "You answer questions using only the numbered excerpts from the user's documents. "
@@ -69,6 +70,9 @@ def span(h, offset, length, sha256=None):
 OWN_SUFFIX = " (its article)"  # a target's name when it is the document the passage belongs to
 LEAD_BONUS = 1.5  # --link-weights det: a linking passage in its document's lead section
 OWN_BONUS = 1.5   # --link-weights det: a passage of the target's own article
+DECIDE_QUESTION = "Which linked topic would most help answer the question, given this passage?"
+DECIDE_MAX_TARGETS = 40  # --link-weights decide: a passage with more targets is asked about the 40 highest-idf
+NONE_OPTION = "none"     # --link-weights decide: the option for "no link helps"
 
 
 async def link_neighbours(graph, passage_ids: list[str]):
@@ -215,18 +219,14 @@ async def det_links(question: str, cands: dict[str, list[str]], degree: dict[str
                     n: int, lam: float):
     """The n candidates with the best final rank (weigh_links), each with its weight components."""
     graph, _ = await store.engines()
-    total = (await graph.query("MATCH (p:Node) WHERE p.type = 'DocPassage' RETURN count(p)", {}))[0][0]
     dist = await distances(question, cands)
     cands = {pid: ts for pid, ts in cands.items() if pid in dist}
     if not cands:
         return []
     nodes = {nd["id"]: store.node_props(nd) for nd in await graph.get_nodes(list(cands))}
     lead = {pid: " › " not in nodes[pid]["path"] for pid in cands}
-    idf = {}
-    for ts in cands.values():
-        for t in ts:
-            base = t[:-len(OWN_SUFFIX)] if t.endswith(OWN_SUFFIX) else t
-            idf[base] = math.log(total / (1 + degree[base]))
+    bases = {t[:-len(OWN_SUFFIX)] if t.endswith(OWN_SUFFIX) else t for ts in cands.values() for t in ts}
+    idf = await link_idf(graph, bases, degree)
     records = weigh_links(cands, {pid: 1 - dist[pid] for pid in cands}, idf, support, lead, lam)
     top = sorted(records, key=lambda pid: (-records[pid]["final"], pid))[:n]
     added = await hits_for(top, {pid: round(dist[pid], 4) for pid in top})
@@ -236,11 +236,119 @@ async def det_links(question: str, cands: dict[str, list[str]], degree: dict[str
     return added
 
 
-async def expand_links(question: str, hits, n: int, max_degree: int, weights: str = "none", lam: float = 0.5):
+async def link_idf(graph, names, degree: dict[str, int]) -> dict[str, float]:
+    """idf of each target name: log(DocPassages / (1 + passages linking to the target))."""
+    total = (await graph.query("MATCH (p:Node) WHERE p.type = 'DocPassage' RETURN count(p)", {}))[0][0]
+    return {n: math.log(total / (1 + degree[n])) for n in names}
+
+
+async def outgoing_links(graph, passage_ids: list[str]) -> dict[str, dict[str, str]]:
+    """{passage id: {target name: anchor text}} for the links_to edges out of the given passages. The anchor is the
+    edge's "anchor" property, or the target's name when the link has none."""
+    rows = await graph.query(
+        "MATCH (p:Node)-[r:EDGE]->(t:Node) WHERE p.id IN $ids AND r.relationship_name = 'links_to' "
+        "RETURN p.id, t.name, r.properties", {"ids": passage_ids})
+    out: dict[str, dict[str, str]] = {}
+    for pid, name, props in rows:
+        if isinstance(props, str):
+            props = json.loads(props)
+        out.setdefault(pid, {}).setdefault(name, (props or {}).get("anchor") or name)
+    return out
+
+
+def link_criteria(targets: dict[str, str]) -> dict[str, str]:
+    """The choice options of one passage: each target named, described as the anchor it is linked as, and a
+    "none" option (renamed only if a target is itself called "none")."""
+    none = NONE_OPTION
+    while none in targets:
+        none = "_" + none
+    criteria = {t: f"linked as: {anchor}" for t, anchor in targets.items()}
+    criteria[none] = "none of these links helps answer the question"
+    return criteria
+
+
+def ask_links(question: str, passages: list[dict], decider, log_path: Path | None = None) -> dict[tuple[str, str], float]:
+    """--link-weights decide: for each passage ({id, path, text, targets: {name: anchor}}), ask the decision model
+    which of its linked topics would most help answer the question. Returns {(passage id, target name): p_target}.
+    Each decision is appended to log_path when given."""
+    probs = {}
+    for p in passages:
+        state = f"Question: {question}\n\nPassage ({p['path']}):\n{p['text']}"
+        q = {"type": "choice", "instructions": DECIDE_QUESTION, "criteria": link_criteria(p["targets"])}
+        d = decider.decide(state, {"link": q})["link"]
+        for t in p["targets"]:
+            probs[(p["id"], t)] = d.probabilities.get(t, 0.0)
+        if log_path:
+            rec = {"question": question, "passage": p["path"], "passage_id": p["id"], "choice": d.choice,
+                   "probabilities": d.probabilities, "options": link_criteria(p["targets"])}
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return probs
+
+
+def weigh_decided(cands: dict[str, list[str]], probs: dict[tuple[str, str], float], sims: dict[str, float],
+                  lam: float) -> dict[str, dict]:
+    """--link-weights decide: each candidate's link score, the sum over the (hit, target) pairs reaching it of the
+    decision model's p_target, normalized by the best candidate's, and its final rank lam x normalized link score +
+    (1 - lam) x similarity. cands: {passage: [target name, or name + OWN_SUFFIX for the target's own article]}."""
+    by_target: dict[str, list[tuple[str, float]]] = {}
+    for (hid, t), p in probs.items():
+        by_target.setdefault(t, []).append((hid, p))
+    records = {}
+    for pid, ts in cands.items():
+        reaching = []
+        for t in ts:
+            base = t[:-len(OWN_SUFFIX)] if t.endswith(OWN_SUFFIX) else t
+            for hid, p in by_target.get(base, []):
+                reaching.append({"target": t, "from": hid, "p_target": p})
+        records[pid] = {"score": sum(r["p_target"] for r in reaching), "targets": reaching}
+    best = max((r["score"] for r in records.values()), default=0.0)
+    for pid, r in records.items():
+        norm = r["score"] / best if best > 0 else 0.0
+        records[pid] = {"link_score": round(r["score"], 4), "norm_link": round(norm, 4),
+                        "similarity": round(sims[pid], 4), "final": round(lam * norm + (1 - lam) * sims[pid], 4),
+                        "targets": [{**r_, "p_target": round(r_["p_target"], 4)} for r_ in r["targets"]]}
+    return records
+
+
+async def decide_links(question: str, hits, cands: dict[str, list[str]], out_links: dict[str, dict[str, str]],
+                       degree: dict[str, int], n: int, lam: float, decider, max_bytes: int,
+                       log_path: Path | None):
+    """The n candidates with the best final rank under the decision model's link weights (weigh_decided). out_links:
+    each hit's targets after the max-degree cut-off. A passage with more than DECIDE_MAX_TARGETS targets is asked
+    about the ones with the highest idf only."""
+    graph, _ = await store.engines()
+    dist = await distances(question, cands)
+    cands = {pid: ts for pid, ts in cands.items() if pid in dist}
+    if not cands:
+        return []
+    idf = await link_idf(graph, {t for ts in out_links.values() for t in ts}, degree)
+    passages = []
+    for h in read_hits([h for h in hits if out_links.get(h["id"])], "passage", max_bytes):
+        targets = out_links[h["id"]]
+        if len(targets) > DECIDE_MAX_TARGETS:
+            kept = sorted(targets, key=lambda t: -idf[t])[:DECIDE_MAX_TARGETS]
+            print(f"docmem decide: {h['path']} links to {len(targets)} targets; asking about the "
+                  f"{DECIDE_MAX_TARGETS} with the highest idf", file=sys.stderr, flush=True)
+            targets = {t: targets[t] for t in kept}
+        passages.append({"id": h["id"], "path": h["path"], "text": h["text"], "targets": targets})
+    probs = ask_links(question, passages, decider, log_path)
+    records = weigh_decided(cands, probs, {pid: 1 - dist[pid] for pid in cands}, lam)
+    top = sorted(records, key=lambda pid: (-records[pid]["final"], pid))[:n]
+    added = await hits_for(top, {pid: round(dist[pid], 4) for pid in top})
+    for h in added:
+        h["weights"] = records[h["id"]]
+        h["via"] = cands[h["id"]]
+    return added
+
+
+async def expand_links(question: str, hits, n: int, max_degree: int, weights: str = "none", lam: float = 0.5,
+                       decider=None, max_bytes: int = 6000, decision_log: Path | None = None):
     """Add up to n passages reached through links from the hits. Targets linked from more than max_degree
     passages (e.g. a country) are too common to say anything and are not followed. Ranked by the question's
-    similarity to their stored vectors (weights none), or by the deterministic link weights (weights det,
-    see weigh_links)."""
+    similarity to their stored vectors (weights none), by the deterministic link weights (weights det, see
+    weigh_links), or by the decision model's choice of linked topic for each hit (weights decide, see
+    decide_links). If the decision model is unreachable the question falls back to det, with a warning."""
     graph, _ = await store.engines()
     via, degree, support = await link_neighbours(graph, [h["id"] for h in hits])
     common = {t for t, d in degree.items() if d > max_degree}
@@ -248,9 +356,24 @@ async def expand_links(question: str, hits, n: int, max_degree: int, weights: st
     cands = {pid: ts for pid, ts in cands.items() if ts}
     if not cands:
         return hits, []
+    added = None
+    if weights == "decide":
+        if decider is None:
+            raise ValueError("--link-weights decide needs a decider (DOCMEM_DECIDER_URL and DOCMEM_DECIDER_MODEL)")
+        out_links = {pid: {t: anchor for t, anchor in ts.items() if t not in common}
+                     for pid, ts in (await outgoing_links(graph, [h["id"] for h in hits])).items()}
+        try:
+            added = await decide_links(question, hits, cands, out_links, degree, n, lam, decider, max_bytes,
+                                       decision_log)
+        except DeciderResponseError:
+            raise  # the server answered, but not in the shape this client reads: a bug to see, not a fallback
+        except DeciderError as e:
+            print(f"docmem: --link-weights decide fell back to det for this question: {e}", file=sys.stderr,
+                  flush=True)
+            weights = "det"
     if weights == "det":
         added = await det_links(question, cands, degree, support, n, lam)
-    else:
+    elif weights == "none":
         added = await best_of(question, cands, n)
         for h in added:
             h["via"] = cands[h["id"]]
@@ -566,10 +689,13 @@ async def ask_one(question: str, a, chat):
         timing["concepts_ms"] = round((time.time() - t) * 1000, 1)
     if a.links:
         t = time.time()
+        before = dict(a.decider.stats) if a.decider else None
         hits, by_links = await expand_links(question, hits, a.links, a.link_max_degree, a.link_weights,
-                                            a.link_lambda)
+                                            a.link_lambda, a.decider, a.max_bytes, a.decision_log)
         linked += by_links
         timing["links_ms"] = round((time.time() - t) * 1000, 1)
+        if before is not None:
+            timing["decide"] = {k: round(a.decider.stats[k] - before[k], 3) for k in before}
     hits = read_hits(hits, a.context, a.max_bytes)
     t = time.time()
     if a.rerank and chat:
@@ -631,12 +757,20 @@ def add_common(ap):
                          "linked document itself), ranked by similarity; no LLM; 0 = off")
     ap.add_argument("--link-max-degree", type=int, default=50,
                     help="do not follow targets linked from more passages than this (too common)")
-    ap.add_argument("--link-weights", choices=("none", "det"), default="none",
+    ap.add_argument("--link-weights", choices=("none", "det", "decide"), default="none",
                     help="--links ranking: none = the question's similarity; det = deterministic link weights "
                          "(idf of the target, support from the hits, lead section, own article) mixed with the "
-                         "similarity by --link-lambda; no LLM")
+                         "similarity by --link-lambda; no LLM; decide = a decision model (DOCMEM_DECIDER_*) picks, "
+                         "for each hit passage, the linked topic that would most help answer the question; its "
+                         "probabilities are the link weights (falls back to det when the model is unreachable)")
     ap.add_argument("--link-lambda", type=float, default=0.5,
-                    help="--link-weights det: weight of the link score against the similarity (0 to 1)")
+                    help="--link-weights det or decide: weight of the link score against the similarity (0 to 1)")
+    ap.add_argument("--decider-cache", type=Path, metavar="FILE",
+                    help="--link-weights decide: cache the decisions in this JSONL file (hashes and results only), "
+                         "so a rerun asks the model nothing it has answered")
+    ap.add_argument("--decision-log", type=Path, metavar="FILE",
+                    help="--link-weights decide: append each decision (question, passage, options and their "
+                         "probabilities) to this JSONL file")
     ap.add_argument("--concepts", type=int, default=0, metavar="N",
                     help="add up to N passages of other documents sharing a concept (level 2 or deeper, from "
                          "docmem classify) with the hits' documents, ranked by similarity; no LLM; 0 = off")
@@ -682,6 +816,14 @@ def open_db(a):
         raise SystemExit("docmem ask: --with-model needs --model-db")
     if a.with_prose and not a.prose_db:
         raise SystemExit("docmem ask: --with-prose needs --prose-db")
+    a.decider = None
+    if a.link_weights == "decide":
+        from .decide import Decider
+
+        try:
+            a.decider = Decider.from_env(cache=a.decider_cache)
+        except DeciderError as e:
+            raise SystemExit(f"docmem: --link-weights decide: {e}")
     store.configure(a.db, api_base=a.api_base or os.environ.get("DOCMEM_API_BASE"),
                     api_key=a.api_key or os.environ.get("DOCMEM_API_KEY"))
     from .llm import Chat
