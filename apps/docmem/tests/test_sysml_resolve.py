@@ -9,7 +9,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from docmem.scan_sysml import parse_model  # noqa: E402
-from docmem.sysml_resolve import Member, Universe, inherited_members, metaclass_for  # noqa: E402
+from docmem.sysml_resolve import (  # noqa: E402
+    Member,
+    Universe,
+    inherited_members,
+    metaclass_for,
+    relation_id,
+    statement_edges,
+)
 
 URI = "file:///models/t.sysml"
 
@@ -119,19 +126,62 @@ def test_redefinition_resolves_to_the_redefined_feature_not_itself():
     assert refs == [] or uni.resolve(refs[0].text, refs[0].chain, redef.qname).target == "Inh::Base::mass"
 
 
-def test_an_unnamed_usage_with_a_body_is_a_scope_for_its_redefinitions():
-    # the engine redefined in Racer is an unnamed usage (no section), so `cyl` is looked up through its type
+def test_an_unnamed_redefinition_is_a_named_scope_for_its_body():
+    # part :>> engine is named after the engine it redefines, so its body's cyl is looked up through Car's engine type
     uni = universe_of(
         "package A {\n"
         "  part def Engine { part cyl; }\n"
         "  part def Car { part engine : Engine; }\n"
         "  part def Racer :> Car { part :>> engine { part :>> cyl; } }\n"
         "}\n")
-    cyl = [f for f in uni.references() if f.as_written == "cyl"]
-    assert len(cyl) == 1
-    assert cyl[0].status == "anonymous" and cyl[0].target == "A::Engine::cyl"
-    assert not cyl[0].rel  # no section to draw the edge from
-    assert not any(e.name is None for e in uni.elements)  # the scope is not an element
+    engine = next(e for e in uni.elements if e.qname == "A::Racer::engine")
+    assert engine.unnamed and engine.kind == "part"
+    refs = {f.as_written: f for f in uni.references() if f.fragment == "redefines"}
+    assert refs["engine"].status == "resolved" and refs["engine"].source.qname == "A::Racer::engine"
+    assert refs["engine"].target == "A::Car::engine"
+    cyl = refs["cyl"]
+    assert cyl.status == "resolved" and cyl.rel == "r_redefines"
+    assert cyl.source.qname == "A::Racer::engine::cyl" and cyl.target == "A::Engine::cyl"
+    assert not any(e.name is None for e in uni.elements)  # the scope of a redefinition is an element
+
+
+def test_a_redefining_usage_with_a_value_is_the_source_of_its_redefines_edge():
+    # attribute :>> powerLoad = 450 [W]; used to take its enclosing element as the source
+    uni = universe_of(
+        "package A {\n"
+        "  part def Car { attribute powerLoad; }\n"
+        "  part def Racer :> Car { attribute :>> powerLoad = 450 [W]; ref :>> powerLoad; }\n"
+        "}\n")
+    edges = [(f.source.qname, f.rel, f.target) for f in uni.references() if f.rel == "r_redefines"]
+    assert ("A::Racer::powerLoad", "r_redefines", "A::Car::powerLoad") in edges
+
+
+def test_repeated_statements_keep_one_edge_each():
+    uni = universe_of(
+        "package M {\n"
+        "  requirement def R;\n"
+        "  part def Q {\n"
+        "    satisfy R by Y;\n"
+        "    satisfy R by Y;\n"
+        "  }\n"
+        "  part def Y;\n"
+        "}\n")
+    named = statement_edges(uni.references())
+    sat = [(f, rel) for f, rel in named if f.rel == "r_satisfy"]
+    assert len(sat) == 2 and len({rel for _, rel in sat}) == 2
+    assert {(f.source.qname, f.target) for f, _ in sat} == {("M::Y", "M::R")}
+
+
+def test_two_statements_on_one_line_are_told_apart_by_occurrence():
+    uni = universe_of(
+        "package M { requirement def R; part def Y { satisfy R by Y; satisfy R by Y; } part def X; }")
+    names = [rel for f, rel in statement_edges(uni.references()) if f.rel == "r_satisfy"]
+    assert len(names) == 2 and len(set(names)) == 2
+    assert names[0] == relation_id("r_satisfy", URI, 1, 0) and names[1] == relation_id("r_satisfy", URI, 1, 1)
+
+
+def test_relation_identity_is_the_relation_then_the_statement():
+    assert relation_id("r_satisfy", "file:///a.sysml", 12, 0) == "r_satisfy@file:///a.sysml:12#0"
 
 
 def test_satisfy_by_names_the_satisfier_and_the_requirement():

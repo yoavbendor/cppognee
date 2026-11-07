@@ -53,6 +53,16 @@ WRITTEN = {"typed_by": "r_typed_by", "specializes": "r_specializes", "subsets": 
 METACLASS_REL = "metaclass"
 EDGE_RELS = tuple(WRITTEN.values()) + (METACLASS_REL,)
 EXAMPLES = 5  # unresolved references shown per fragment
+RELATION_ID = "@"  # the separator in an edge's relationship_name between its relation and its statement
+
+
+def relation_id(rel: str, uri: str, line: int, occurrence: int) -> str:
+    """The relationship_name of the edge one written statement makes. A graph keeps one edge per (source, target,
+    relationship_name), so statements that write the same relation between the same elements (satisfy X by Y, on two
+    lines) need distinct names: the relation, then the file and line of the statement, then its occurrence on that
+    line. Reads match the bare relation name or this prefix (_relation_rows)."""
+    return f"{rel}{RELATION_ID}{uri}:{line}#{occurrence}"
+
 
 # The scanner's kind (keywords, with the modifiers in front) -> the metaclass of the metamodel (sysml_metamodel.ttl).
 KIND_METACLASS = {
@@ -202,7 +212,9 @@ class Universe:
                 for r in self.header_refs.get(id(el), []):
                     if r.fragment in SUPER_FRAGS:
                         declared = True
-                        res = self._resolve(r.text, r.chain, None, set())
+                        # a redefinition's name is the feature it redefines, never the redefinition itself
+                        excl = qname if r.fragment == "redefines" else None
+                        res = self._resolve(r.text, r.chain, excl, set())
                         if res.target is not None and res.target not in out:
                             out.append(res.target)
             first = self.by_qname.get(qname)
@@ -511,9 +523,8 @@ async def replace_edges(edges: list[tuple]) -> int:
         graph, _ = await store.engines()
         old = []
         for rel in EDGE_RELS:
-            rows = await graph.query(
-                "MATCH (a:Node)-[r:EDGE]->(b:Node) WHERE r.relationship_name = $rel RETURN a.id, b.id", {"rel": rel})
-            old += [EdgeIdentity(source_id=str(a), target_id=str(b), relationship_name=rel) for a, b in rows]
+            old += [EdgeIdentity(source_id=a, target_id=b, relationship_name=name)
+                    for a, b, name, _ in await _relation_rows(graph, rel)]
         await graph.delete_edge_triples(old)
         await graph.add_edges(edges)
         counts["replaced"] = len(old)
@@ -523,6 +534,20 @@ async def replace_edges(edges: list[tuple]) -> int:
                                               dataset=store.DATASET)
     _check_pipeline(result, "model-resolve")
     return counts["replaced"]
+
+
+def statement_edges(found: list[Found]) -> list[tuple[Found, str]]:
+    """Each resolved reference that writes an edge, with that edge's relationship_name (relation_id): the position of
+    the statement tells apart statements that write the same relation between the same elements."""
+    occurrence: Counter = Counter()
+    out = []
+    for f in found:
+        if f.status != "resolved" or not f.rel or f.source is None:
+            continue
+        key = (f.uri, f.line, f.rel)
+        out.append((f, relation_id(f.rel, f.uri, f.line, occurrence[key])))
+        occurrence[key] += 1
+    return out
 
 
 def _parse_files(uris: list[str]):
@@ -576,13 +601,11 @@ async def resolve_async(db: Path, out) -> dict:
 
     found = uni.references()
     edges, unmapped, mapped = [], Counter(), 0
-    for f in found:
-        if f.status != "resolved" or not f.rel or f.source is None:
-            continue
+    for f, rel in statement_edges(found):
         tgt = uni.by_qname[f.target][0]
         props = {"edge_text": f"{_short(f.source.qname)} {f.rel} {_short(f.target)}",
                  "as_written": f.as_written, "file": f.uri, "line": f.line}
-        edges.append((str(sec_of[id(f.source)]["id"]), str(sec_of[id(tgt)]["id"]), f.rel, props))
+        edges.append((str(sec_of[id(f.source)]["id"]), str(sec_of[id(tgt)]["id"]), rel, props))
     for el, name, notes in uni.metaclasses():
         if name is None:
             unmapped[el.kind] += 1
@@ -766,12 +789,22 @@ async def show_async(name: str, out) -> None:
         out.write(f"  {m.name}  ({m.kind})  from {src}  [{m.where}]\n")
 
 
-async def _edges(graph, rel: str):
-    rows = await graph.query("MATCH (a:Node)-[r:EDGE]->(b:Node) WHERE r.relationship_name = $rel "
-                             "RETURN a.id, b.id, r.properties", {"rel": rel})
-    for a, b, props in rows:
+async def _relation_rows(graph, rel: str) -> list[tuple[str, str, str, dict]]:
+    """(source, target, relationship_name, properties) of every edge of relation rel: one per written statement
+    (see relation_id). A relation's own name is matched too, for edges written before statements were told apart."""
+    rows = await graph.query(
+        "MATCH (a:Node)-[r:EDGE]->(b:Node) WHERE r.relationship_name = $rel OR r.relationship_name STARTS WITH $prefix "
+        "RETURN a.id, b.id, r.relationship_name, r.properties", {"rel": rel, "prefix": rel + RELATION_ID})
+    out = []
+    for a, b, name, props in rows:
         p = json.loads(props) if isinstance(props, str) else (props or {})
-        yield str(a), str(b), p
+        out.append((str(a), str(b), name, p))
+    return out
+
+
+async def _edges(graph, rel: str):
+    for a, b, _, props in await _relation_rows(graph, rel):
+        yield a, b, props
 
 
 def show_main(argv=None):

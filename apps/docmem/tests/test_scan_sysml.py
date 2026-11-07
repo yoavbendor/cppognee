@@ -357,3 +357,63 @@ def test_command_line_writes_one_stream_and_summary_to_stderr(tmp_path, capsys):
     docs = [r for r in lines if r["type"] == "doc"]
     assert len(docs) == 1 and docs[0]["uri"].endswith("/a.sysml")
     assert json.loads(err)["files"] == 1
+
+
+
+# -- unnamed redefinitions: named after the feature they redefine ------------------------------------------
+
+REDEFINITIONS = b"""package P {
+  part def Car { part crew; attribute powerLoad; ref y; }
+  part def Racer :> Car {
+    part :>> crew { part spaceSuits; }
+    attribute :>> powerLoad = 450 [W];
+    ref :>> y;
+    :>> crew;
+  }
+}
+"""
+
+
+def test_unnamed_redefinitions_are_sections_named_after_the_redefined_feature():
+    recs = records_of(REDEFINITIONS)
+    secs = {r["path"][-1]: r for r in of_type(recs, "section")}
+    for label in ("part crew", "attribute powerLoad", "ref redefinition y", "redefinition crew"):
+        assert secs[label]["unnamed_redefinition"] is True, label
+    # Car's own features are declarations, not redefinitions
+    car_crew = next(r for r in of_type(recs, "section") if r["path"][-2:] == ["part def Car", "part crew"])
+    assert "unnamed_redefinition" not in car_crew
+
+
+def test_a_redefinition_body_is_a_scope_for_its_children():
+    paths = [r["path"] for r in of_type(records_of(REDEFINITIONS), "section")]
+    assert ["model", "m", "package P", "part def Racer", "part crew", "part spaceSuits"] in paths
+
+
+def test_a_redefinition_is_the_source_of_its_link_and_never_its_own_target():
+    lk = links(REDEFINITIONS)
+    # the scanner resolves names by declaration only: the redefined name is not found, so it stays as written
+    assert ("crew", "crew", "redefines") in lk
+    assert ("powerLoad", "powerLoad", "redefines") in lk
+    assert ("y", "y", "redefines") in lk
+    assert all(t != "P::Racer::crew" for a, t, _ in lk if a == "crew")
+
+
+def test_kerml_unnamed_redefinition_is_named_after_the_feature_and_a_list_redefines_each():
+    src = (b"package P {\n  feature def Q {\n    in feature monitor redefines onOccurrence {\n"
+           b"      feature redefines startingAt {\n        feature redefines accessedFeature, observations;\n"
+           b"      }\n    }\n  }\n}\n")
+    recs = records_of(src)
+    unnamed = [r["path"][-1] for r in of_type(recs, "section") if r.get("unnamed_redefinition")]
+    assert unnamed == ["feature startingAt", "feature accessedFeature"]
+    assert ["model", "m", "package P", "feature def Q", "in feature monitor", "feature startingAt",
+            "feature accessedFeature"] in [r["path"] for r in of_type(recs, "section")]
+    lk = links(src)
+    assert ("onOccurrence", "onOccurrence", "redefines") in lk  # the named monitor redefines it
+    assert ("accessedFeature", "accessedFeature", "redefines") in lk
+    assert ("observations", "observations", "redefines") in lk
+
+
+def test_a_value_after_an_unnamed_redefinition_is_not_a_redefinition():
+    lk = links(b"package P { part def A { attribute :>> mass = dryMass + fuel; } }\n")
+    assert ("mass", "mass", "redefines") in lk
+    assert not any(a in ("dryMass", "fuel") for a, _, _ in lk)

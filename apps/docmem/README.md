@@ -233,7 +233,9 @@ docmem model-show --db $MODEL "Apollo11::LunarModule"
   unmapped and listed in the report, with no edge. A bare `in x : T` (no keyword) is a `Feature`.
 - **Resolved edges** between sections: `r_typed_by`, `r_specializes`, `r_subsets`, `r_redefines`, `r_satisfy`
   (satisfier to requirement, from `satisfy X by Y`, or the owner when there is no `by`), `r_allocate` (`allocate A to
-  B`: A to B) and `r_perform`. Each carries `as_written`, `file` and `line`. Re-running replaces them.
+  B`: A to B) and `r_perform`. Each carries `as_written`, `file` and `line`. Re-running replaces them. A graph keeps one
+  edge per (source, target, relationship name), so each written statement gets its own relationship name,
+  `r_satisfy@FILE:LINE#N` (`relation_id`): two identical `satisfy` lines are two edges, and the export emits both.
 - **Resolution rules** (`docmem/sysml_resolve.py`): a head name is looked up in the enclosing namespaces, innermost
   first; in each: owned members, then inherited members (supertypes and typings, breadth first, so the most specific
   wins), then imports. `import X::*` brings in the public members of X, `import X::**` also those of the namespaces X
@@ -243,9 +245,16 @@ docmem model-show --db $MODEL "Apollo11::LunarModule"
   (`part` → `Parts::Part`, `connection` → `Connections::Connection`, and so on: `DEFAULT_SUPERTYPE`), and every type
   has `Base::Anything` as its least specific supertype (KerML). `model-show` lists only the declared types: implicit
   ones are not edges.
-- **Anonymous usages:** an unnamed usage with a body (`attribute :>> x { attribute :>> y; }`) is a scope for the names in
-  its body, through its own redefinitions and typings. It has no section, so a reference inside it resolves but writes
-  no edge (status `anonymous`). Its body's qualified names carry a `<anon OFFSET>` segment.
+- **Unnamed redefinitions:** a usage with no name of its own that redefines a feature (`part :>> crew { ... }`,
+  `attribute :>> powerLoad = 450 [W];`, `ref :>> y;`, `:>> x;`, KerML `feature redefines x`) is named after that feature,
+  as in SysML v2. Its section label is its kind and that name (`part crew`, `ref redefinition y`), and its stream record
+  carries `"unnamed_redefinition": true` (the DB keeps no such flag). It is the source of its `r_redefines` edge, and
+  its body is a scope for its children (`...::crew::spaceSuits`).
+- **Anonymous usages:** an unnamed usage with a body and no redefinition (`part : T { part x; }`) is a scope for the
+  names in its body, through its own typings. It has no section, so a reference inside it resolves but writes no edge
+  (status `anonymous`). Its body's qualified names carry a `<anon OFFSET>` segment. A bare `part : T;` has neither a
+  section nor a scope, and its links belong to the enclosing element. Unnamed specializations (`part :> x`) are not
+  renamed.
 - **Aliases:** `alias X for Y;` is an element of kind `alias`; a lookup that finds it continues at Y. Short names
   (`<'FLR-R001'> Name`) are second keys of their element.
 - **What is approximated:** redefinition is matched by name, not by feature identity, and a feature with the same name

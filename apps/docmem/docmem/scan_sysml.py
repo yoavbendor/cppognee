@@ -23,9 +23,17 @@ extractor "", "format": "sysml" or "kerml", "model": NAME), then per file
 Statements the scanner does not model (transitions, successions, expressions, ...) are skipped; their leading
 words are reported on stderr with file:line examples.
 
-An unnamed usage with a body (``attribute :>> x { attribute :>> y; }``) has no section. It is a scope for the names in
-its body: their qualified names carry a segment ``<anon OFFSET>`` (OFFSET: where the usage starts). The resolver
-(docmem.sysml_resolve) uses it; the stream's link targets name such an element by that qualified name.
+An unnamed redefinition has the name of the feature it redefines, as in SysML v2: ``part :>> crew { ... }``,
+``attribute :>> powerLoad = 450 [W];``, ``ref :>> y;`` and ``:>> x;`` are sections labelled with their kind and that
+name ("part crew", "attribute powerLoad", "ref redefinition y", "redefinition x"). Such a section carries
+``"unnamed_redefinition": true``. The usage is the source of its ``redefines`` link (its body is a scope for its
+children, so their qualified names go through it). The redefinition's own name is never its redefined target.
+
+An unnamed usage with a body and no redefinition (``part : T { part x; }``) has no section. It is a scope for the
+names in its body: their qualified names carry a segment ``<anon OFFSET>`` (OFFSET: where the usage starts). The
+resolver (docmem.sysml_resolve) uses it; the stream's link targets name such an element by that qualified name.
+A bare unnamed usage (``part : T;``) has neither a section nor a scope; its links belong to the enclosing element.
+Unnamed specializations (``part :> x``) are not renamed and keep that rule.
 """
 
 import argparse
@@ -133,6 +141,7 @@ class Element:
         self.vis = "public"  # its visibility modifier, public when none is written
         self.uri = ""
         self.alias = None  # a short name (<'FLR-R001'> Name), which is a second name for the element
+        self.unnamed = False  # a redefinition with no name of its own (part :>> crew): named after crew
 
 
 class Ref:
@@ -288,6 +297,8 @@ class _File:
             k += 1
         if self.is_keyword(k):
             return self.declaration(i, k, owner, chain, generic=False)
+        if k + 1 < n and is_p(toks[k], ":>>") and toks[k + 1].kind in ("id", "q"):
+            return self.redefinition(i, k, owner, chain)  # ref :>> y; the modifiers are part of its kind
         if k < n and toks[k].kind == "id" and toks[k].text in VERBS:
             return self.relation(k, owner, chain)
         if k > i and k + 1 < n and toks[k].kind == "id" and toks[k].text not in STOP \
@@ -296,20 +307,21 @@ class _File:
         return self.unknown(i, owner, chain)
 
     def redefinition(self, i: int, j: int, owner, chain: list) -> int:
-        """:>> name ... / :> name ...: a usage that redefines or specializes a feature of its owner's type."""
-        name_tok = self.toks[j + 1]
-        frag, kind = ("redefines", "redefinition") if self.toks[j].text == ":>>" else ("specializes", "specialization")
-        n_ref, n_el = len(self.refs), len(self.elements)
-        self.refs.append(Ref(name_tok.start, name_tok.end, name_tok.text, frag, chain))
-        nxt = self.usage(i, kind, "", name_tok, j + 2, None, owner, chain)
-        if len(self.elements) > n_el:  # the usage it declares is the owner of its redefined name
-            self.refs[n_ref].owner = self.elements[n_el]
-        return nxt
+        """[modifiers] :>> name ... / :> name ...: a usage that redefines or specializes a feature of its owner's
+        type. i is its first token, j the operator. Only :>> names the usage after the feature (see usage)."""
+        toks = self.toks
+        name_tok = toks[j + 1]
+        mods = [t.text for t in toks[i:j] if t.kind == "id" and t.text not in VISIBILITY]
+        if toks[j].text == ":>>":
+            frag, base = "redefines", "redefinition"
+        else:
+            frag, base = "specializes", "specialization"
+        return self.usage(i, " ".join(mods + [base]), "", name_tok, j + 2, None, owner, chain, name_ref=frag)
 
     def declaration(self, mstart: int, k: int, owner, chain: list, generic: bool) -> int:
         toks, n = self.toks, self.n
         mods = [t.text for t in toks[mstart:k] if t.text not in VISIBILITY]
-        short = None
+        short, name_ref = None, None
         if generic:
             kw, kind, name_tok, hstart = "", " ".join(mods), toks[k], k + 1
         else:
@@ -338,13 +350,19 @@ class _File:
                 m = close + 1
             if m < n and self.is_name(m):
                 name_tok, hstart = toks[m], m + 1
+            elif m + 1 < n and is_p(toks[m], ":>>") and toks[m + 1].kind in ("id", "q"):
+                name_tok, hstart, name_ref = toks[m + 1], m + 2, "redefines"  # part :>> crew: named crew
+            elif m + 1 < n and toks[m].kind == "id" and toks[m].text == "redefines" and toks[m + 1].kind in ("id", "q"):
+                name_tok, hstart, name_ref = toks[m + 1], m + 2, "redefines"  # KerML: feature redefines crew
             else:
                 name_tok, hstart = None, m
-        return self.usage(mstart, kind, kw, name_tok, hstart, short, owner, chain)
+        return self.usage(mstart, kind, kw, name_tok, hstart, short, owner, chain, name_ref=name_ref)
 
-    def usage(self, mstart: int, kind: str, kw: str, name_tok, hstart: int, short, owner, chain: list) -> int:
-        """A declaration's header and body. A usage with no name (no name_tok and no short name) is not a section:
-        its text and links still belong to the enclosing element."""
+    def usage(self, mstart: int, kind: str, kw: str, name_tok, hstart: int, short, owner, chain: list,
+              name_ref: str | None = None) -> int:
+        """A declaration's header and body. name_ref is the fragment of the name written as a redefinition or
+        specialization (:>> crew, :> crew), whose source is this usage. A usage with no name (no name_tok and no short
+        name) is not a section: its text and links still belong to the enclosing element."""
         toks = self.toks
         if name_tok is not None:
             name, alias = name_tok.text, short
@@ -353,7 +371,7 @@ class _File:
         verb = kw if kw in VERBS else None
         hend, term = self.header_end(hstart, eq_term=(kw != "bind"))
         if name is None:
-            # an unnamed usage with a body (attribute :>> x { attribute :>> y; }) is a namespace for the names in its
+            # an unnamed usage with a body (attribute : x { attribute :>> y; }) is a namespace for the names in its
             # body, which its own redefinitions or typings supply. It is not an element: it has no section.
             anon = None
             if term == "{" and kw and verb is None:
@@ -376,11 +394,16 @@ class _File:
                      start, self.line_of(start))
         el.parent, el.uri, el.alias = parent, self.uri, alias
         el.vis = next((t.text for t in toks[mstart:hstart] if t.kind == "id" and t.text in VISIBILITY), "public")
+        el.unnamed = name_ref == "redefines"
         self.elements.append(el)
         self.model.declare(parent, name, qname)
         if alias is not None:
             self.model.declare(parent, alias, qname)
-        self.header_refs(hstart, hend, verb, None, chain, owner=el, stmt=mstart)
+        if name_ref is not None:  # the redefined or specialized name is written before hstart, owned by this usage
+            self.refs.append(Ref(name_tok.start, name_tok.end, name_tok.text, name_ref, chain, owner=el, stmt=mstart))
+        # feature redefines a, b: the list goes on after the first name
+        more = name_ref if name_ref is not None and hstart < self.n and is_p(toks[hstart], ",") else None
+        self.header_refs(hstart, hend, verb, more, chain, owner=el, stmt=mstart)
         head_end = hend if term in ("{", ";") else hend - 1
         el.pieces.append((start, toks[head_end].end, True))
         end_tok, nxt = self.finish(term, hend, el, chain + [qname], chain, header_owner=el)
@@ -629,15 +652,16 @@ class Model:
     def declare(self, namespace: str, name: str, qname: str):
         self.decls.setdefault(namespace, {}).setdefault(_key(name), []).append(qname)
 
-    def resolve(self, text: str, chain: list) -> str:
+    def resolve(self, text: str, chain: list, exclude: str | None = None) -> str:
         """The qualified name of a reference: its head is looked up from the innermost namespace outwards, and
-        taken only when that namespace declares exactly one element of that name; otherwise the text as written."""
+        taken only when that namespace declares exactly one element of that name; otherwise the text as written.
+        exclude is the qualified name of the element holding a redefinition: it does not redefine itself."""
         head = HEAD.match(text)
         if head is None:
             return text
         key, tail = _key(head.group(0)), text[head.end():]
         for ns in reversed(chain):
-            found = self.decls.get(ns, {}).get(key)
+            found = [q for q in self.decls.get(ns, {}).get(key, []) if q != exclude]
             if found:  # two declarations of one name in one namespace are ambiguous, even if identical
                 return f"{found[0]}{tail}" if len(found) == 1 else text
         return text
@@ -646,8 +670,11 @@ class Model:
         for f in self.files:
             yield {"type": "doc", **f.doc, "extractor": "", "format": f.doc.get("format", "sysml"), "model": self.name}
             for el in f.elements:
-                yield {"type": "section", "uri": f.uri, "path": el.path, "level": len(el.path) - 1,
+                rec = {"type": "section", "uri": f.uri, "path": el.path, "level": len(el.path) - 1,
                        "offset": el.start, "length": el.end - el.start, "line": el.line}
+                if el.unnamed:
+                    rec["unnamed_redefinition"] = True  # named after the feature it redefines (not in the DB)
+                yield rec
             passages = 0
             for el in f.elements:
                 for s, e in f.passage_spans(el):
@@ -696,7 +723,8 @@ def parse_model(sources: list, model_name: str, errors: list | None = None) -> M
             errors.append(str(e))
     for f in model.files:
         for r in f.refs:
-            r.target = model.resolve(r.text, r.chain)
+            own = r.owner.qname if r.fragment == "redefines" and r.owner is not None else None
+            r.target = model.resolve(r.text, r.chain, own)
     return model
 
 
