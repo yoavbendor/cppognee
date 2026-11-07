@@ -29,7 +29,7 @@ NAMESPACES = frozenset(
         "book", "education program", "gadget", "gadget talk", "gadget definition", "topic",
     }
 )
-KINDS = ("wiki", "url", "file", "id", "category")
+KINDS = ("wiki", "url", "file", "id", "category", "model")
 INTERLANGUAGE = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]+)*|simple")
 FENCE = re.compile(r"^[ \t]{0,3}(```|~~~)")
 CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.S)

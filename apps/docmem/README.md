@@ -178,6 +178,33 @@ added, maintenance categories are dropped and cycles are broken (the closing edg
 `docmem ontology load --skos FILE.ttl --scheme NAME`. `FILE.doc_categories.json` (next to the Turtle file) maps each
 indexed title to its kept categories, for evaluation. Nothing calls an LLM; category texts are not written to disk.
 
+## SysML v2 models (`scan-sysml`)
+
+`docmem scan-sysml` reads a SysML v2 textual model (a `.sysml` file or a directory of them) and writes the same
+protocol stream: one `doc` per file, a `section` per named element (the path is `["model", NAME, "package P", ...,
+"<kind> <name>"]`), a `passage` per piece of text (header, doc comments, `require constraint`, string values) and a
+`link` per reference (`specializes`, `typed_by`, `satisfy` / `satisfy_by`, `allocate`, `connect`, `bind`, `flow`,
+`perform`, `exhibit`, `import`, `#` metadata). Links have kind `"model"` and a fragment naming the relation. Nothing
+in the model is executed; it is tokenized and parsed.
+
+```sh
+docmem scan-sysml ~/models/apollo --model-name apollo11 > apollo.jsonl
+docmem index --db ~/kb_model apollo.jsonl          # a model DB of its own
+docmem ask --db ~/kb_model --no-answer -k 5 "lunar module descent engine requirements"
+```
+
+- **Separate database:** SysML output belongs in a model DB only. Never index it into a prose DB: the two kinds of
+  section and link do not mean the same thing.
+- **Resolution:** a name is resolved to its qualified name when its first part is declared exactly once in the
+  innermost enclosing namespace that declares it (a package or an element). Otherwise the target is the name as
+  written. Names imported from other packages are usually written as they are.
+- **Text:** a passage's bytes are the text as it appears in the file. Pieces separated only by whitespace form one
+  passage, so a header and its doc comment are one; a rationale or a constraint is its own passage.
+- **Not modelled:** transitions, successions (`first`, `then`), expressions in calc bodies and similar statements are
+  skipped; their leading words are reported on stderr with `file:line` examples.
+- **`check_stream`:** the link kind `"model"` is not in `docmem.links.KINDS`, so `tools/check_stream.py` reports every
+  link as `bad` until `"model"` is added there. The passage and link offsets themselves check out.
+
 ## What changed in cognee (this fork)
 
 1. **`DataPoint.metadata["store_index_text"] = False`** (LanceDB adapter): the index field is embedded, and the vector
