@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Index local documents into cognee on nanolance, keeping vectors and byte-range provenance, not text"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-dependencies = ["cognee", "nanolance", "openai>=1.0", "fastembed"]
+dependencies = ["cognee", "nanolance", "numpy", "pyarrow", "openai>=1.0", "fastembed"]
 
 [project.scripts]
 docmem = "docmem.__main__:main"
