@@ -37,6 +37,7 @@ from .ontology import nodes_of_type
 from .sysml_resolve import _edges
 
 # docmem's relation fragments (resolved edges) -> nomograph's relationship kinds
+TYPE_CHAIN = {"TypedBy", "Specialize", "Redefine"}  # nomograph kinds that carry a type
 REL_KIND = {
     "r_typed_by": "TypedBy",
     "r_specializes": "Specialize",
@@ -266,6 +267,16 @@ def select(
     for r in relations:
         if r.source in keep:
             keep.add(r.target)
+    # the type chain of every referred library element (its typing, specialization, redefinition),
+    # so a view can name the type of `attribute dryMass :> ISQ::mass;`
+    chain = [r for r in relations if r.rel in TYPE_CHAIN]
+    grew = True
+    while grew:
+        grew = False
+        for r in chain:
+            if r.source in keep and r.target not in keep:
+                keep.add(r.target)
+                grew = True
     frontier = list(keep)
     while frontier:  # the owners of the referred elements, so that the Member tree is whole
         owner = owner_of.get(frontier.pop())
@@ -343,7 +354,7 @@ def build_index(
     for r in relations:
         if r.source not in keep or r.target not in keep:
             continue
-        if not include_library and el_of[r.source].model != model:
+        if not include_library and el_of[r.source].model != model and r.rel not in TYPE_CHAIN:
             continue
         rel_kinds[r.rel] += 1
         rels.append(
