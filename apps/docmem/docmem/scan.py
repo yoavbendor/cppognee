@@ -16,6 +16,10 @@ text for the indexer to embed; the indexer does not store it.
 Passages ("meaning" units): a section's blocks (paragraphs, lists, tables, code fences) are merged
 while they fit --target-words, and a block longer than --max-words is split at sentence ends. A
 passage never crosses a heading.
+
+Code and text files: ``--ext .h,.cpp,.yml`` and ``--name CMakeLists.txt`` scan those files too, cut like markdown
+but with no headings (a "#" comment is not a section) and long blocks split at line ends. Their one section is the
+file: passage path [file name], no links. Hidden directories (``.github``) are skipped unless ``--include-hidden``.
 """
 import argparse
 import hashlib
@@ -33,9 +37,11 @@ SENTENCE_END = re.compile(rb"[.!?][\"')\]]*[ \t\n]+(?=[A-Z0-9\"'(\[])")
 SUFFIXES = (".md", ".markdown", ".mdx", ".txt")
 
 
-def blocks(data: bytes):
+def blocks(data: bytes, headings: bool = True):
     """Yield ("heading", level, title, start, end, line) and ("block", None, None, start, end, line):
-    byte ranges of headings and of blank-line separated blocks (a fenced code block is one block)."""
+    byte ranges of headings and of blank-line separated blocks (a fenced code block is one block).
+    With headings=False (code and text files) no line is a heading or a fence: every blank-line
+    separated run is a block, so a '#' comment (CMake, YAML) is not a section."""
     pos, line_no = 0, 1
     cur_start = cur_line = None
     in_fence = None
@@ -45,17 +51,17 @@ def blocks(data: bytes):
         pos = end
         this_line = line_no
         line_no += 1
-        if in_fence is not None:
+        if headings and in_fence is not None:
             if line.lstrip().startswith(in_fence):
                 in_fence = None
             continue
-        m = FENCE.match(line)
+        m = FENCE.match(line) if headings else None
         if m:
             in_fence = m.group(1)
             if cur_start is None:
                 cur_start, cur_line = start, this_line
             continue
-        h = HEADING.match(line)
+        h = HEADING.match(line) if headings else None
         if h or not line.strip():
             if cur_start is not None:
                 yield ("block", None, None, cur_start, start, cur_line)
@@ -91,8 +97,24 @@ def split_long(data: bytes, start: int, end: int, max_words: int, target_words: 
     return [trim(data, a, b) for a, b in pieces if data[a:b].strip()]
 
 
-def passages_of(data: bytes, items, target_words: int, max_words: int):
-    """Merge a section's blocks into passages; items are (start, end, line) byte ranges."""
+def split_lines(data: bytes, start: int, end: int, max_words: int, target_words: int):
+    """Split one long code or text block at line ends into pieces of about target_words. Code has few sentence
+    ends, so split_long would return the whole block; a line is the unit a reader can cite."""
+    cuts = [start] + [start + m.end() for m in re.finditer(rb"\n", data[start:end])] + [end]
+    pieces, piece_start, words = [], start, 0
+    for a, b in zip(cuts, cuts[1:]):
+        w = len(data[a:b].split())
+        if words and words + w > target_words:
+            pieces.append((piece_start, a))
+            piece_start, words = a, 0
+        words += w
+    pieces.append((piece_start, end))
+    return [trim(data, a, b) for a, b in pieces if data[a:b].strip()]
+
+
+def passages_of(data: bytes, items, target_words: int, max_words: int, split=split_long):
+    """Merge a section's blocks into passages; items are (start, end, line) byte ranges. A block over max_words
+    is cut by ``split`` (sentence ends for markdown, lines for code and text)."""
     out, cur, words = [], None, 0
     for start, end, _ in items:
         start, end = trim(data, start, end)
@@ -101,7 +123,7 @@ def passages_of(data: bytes, items, target_words: int, max_words: int):
             if cur:
                 out.append(cur)
                 cur, words = None, 0
-            out.extend(split_long(data, start, end, max_words, target_words))
+            out.extend(split(data, start, end, max_words, target_words))
             continue
         if cur and words + w > target_words:
             out.append(cur)
@@ -117,18 +139,25 @@ def line_at(data: bytes, offset: int, base_offset: int, base_line: int) -> int:
     return base_line + data.count(b"\n", base_offset, offset)
 
 
-def scan_file(path: Path, target_words: int, max_words: int, id_patterns=()):
+def scan_file(path: Path, target_words: int, max_words: int, id_patterns=(), text: bool = False):
+    """Scan one file. ``text`` (code and text files, see iter_files) cuts it with no heading detection, so its one
+    section is the file: passages carry the path [file name] and the file has no links."""
     data = path.read_bytes()
     doc = {"uri": path.resolve().as_uri(), "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
            "mtime": path.stat().st_mtime, "title": None}
+    if text:
+        doc["title"] = path.name
+        yield from scan_bytes(data, doc, path.name, target_words, max_words, links=[], markdown=False)
+        return
     yield from scan_bytes(data, doc, path.stem, target_words, max_words, id_patterns=id_patterns)
 
 
 def scan_bytes(data: bytes, doc: dict, fallback_title: str, target_words: int, max_words: int,
-               links=None, id_patterns=()):
+               links=None, id_patterns=(), markdown: bool = True):
     """Cut markdown ``data`` into the doc's records. ``doc`` holds the doc record's fields (uri, sha256,
     size, mtime, and for a derived text "format", "extractor", ...); title None means the first "# "
-    heading, else fallback_title. Offsets are into ``data``.
+    heading, else fallback_title. Offsets are into ``data``. ``markdown=False`` cuts code or text: no headings,
+    blocks split at line ends.
 
     ``links`` are the document's links (docmem.links), given by a derived text's extractor. Without them a
     markdown document (no "extractor") has its links read from ``data`` with ``id_patterns``; a derived text
@@ -137,9 +166,10 @@ def scan_bytes(data: bytes, doc: dict, fallback_title: str, target_words: int, m
     if links is None:
         links = [] if "extractor" in doc else markdown_links(data, uri, id_patterns)
     links = sorted(links, key=lambda r: r["offset"])
-    events = list(blocks(data))
+    events = list(blocks(data, headings=markdown))
     title = doc.get("title") or next((t for kind, lvl, t, *_ in events if kind == "heading" and lvl == 1),
                                      fallback_title)
+    split = split_long if markdown else split_lines
     yield {"type": "doc", **doc, "title": title}
 
     # sections: (path, level, start, line) in order; a section spans to the next heading of the same or
@@ -163,7 +193,7 @@ def scan_bytes(data: bytes, doc: dict, fallback_title: str, target_words: int, m
 
     def flush():
         nonlocal n_passages
-        for a, b in passages_of(data, group, target_words, max_words):
+        for a, b in passages_of(data, group, target_words, max_words, split):
             span = data[a:b]
             line = line_at(data, a, 0, 1)
             n_passages += 1
@@ -186,12 +216,22 @@ def scan_bytes(data: bytes, doc: dict, fallback_title: str, target_words: int, m
     yield {"type": "end", "uri": uri, "sections": n_sections, "passages": n_passages, "links": len(links)}
 
 
-def iter_files(roots):
+def is_text(path: Path, exts=(), names=()) -> bool:
+    """A code or text file (--ext / --name): cut like markdown with no headings, its path the file name."""
+    return path.suffix.lower() in exts or path.name in names
+
+
+def iter_files(roots, exts=(), names=(), include_hidden: bool = False):
+    """The files to scan: markdown suffixes, plus the code and text files named by ``exts`` (suffixes) or
+    ``names`` (exact file names). Directories are walked recursively; hidden directories (a name starting with
+    a dot) are skipped unless include_hidden."""
     for root in roots:
         p = Path(root)
         if p.is_dir():
-            yield from sorted(f for f in p.rglob("*") if f.is_file() and f.suffix.lower() in SUFFIXES
-                              and not any(part.startswith(".") for part in f.relative_to(p).parts))
+            yield from sorted(f for f in p.rglob("*")
+                              if f.is_file() and (f.suffix.lower() in SUFFIXES or is_text(f, exts, names))
+                              and (include_hidden or not any(part.startswith(".")
+                                                             for part in f.relative_to(p).parts)))
         elif p.is_file():
             yield p
         else:
@@ -206,17 +246,32 @@ def main(argv=None):
     ap.add_argument("--max-words", type=int, default=320, help="split blocks longer than this")
     ap.add_argument("--id-pattern", action="append", default=[], metavar="REGEX",
                     help="every match is an id link (repeatable), e.g. '\\b[A-Z]{2,8}-\\d{1,6}\\b'")
+    ap.add_argument("--ext", default="", metavar=".h,.cpp,...",
+                    help="also scan files with these suffixes as code or text: blank-line blocks, no headings, "
+                         "passage path [file name], no links")
+    ap.add_argument("--name", action="append", default=[], metavar="FILE",
+                    help="also scan files with this exact name as code or text (repeatable), e.g. CMakeLists.txt")
+    ap.add_argument("--include-hidden", action="store_true",
+                    help="scan hidden directories too (e.g. .github/workflows)")
     a = ap.parse_args(argv)
     for pattern in a.id_pattern:
         try:
             re.compile(pattern)
         except re.error as e:
             ap.error(f"--id-pattern {pattern!r}: {e}")
+    exts = tuple(x.strip().lower() for x in a.ext.split(",") if x.strip())
+    for x in exts:
+        if not x.startswith("."):
+            ap.error(f"--ext: {x!r} is not a suffix (start it with a dot)")
     out = sys.stdout
     uris = []
     out.write(json.dumps({"type": "scan_start", "protocol": PROTOCOL}) + "\n")
-    for f in iter_files(a.roots):
-        for rec in scan_file(f, a.target_words, a.max_words, a.id_pattern):
+    for f in iter_files(a.roots, exts, a.name, a.include_hidden):
+        if is_text(f, exts, a.name):
+            recs = scan_file(f, a.target_words, a.max_words, text=True)
+        else:
+            recs = scan_file(f, a.target_words, a.max_words, a.id_pattern)
+        for rec in recs:
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
         uris.append(f.resolve().as_uri())
     out.write(json.dumps({"type": "scan_end", "roots": [Path(r).resolve().as_uri() for r in a.roots],

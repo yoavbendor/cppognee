@@ -1,6 +1,8 @@
 """Alignment between the prose KB and the SysML model DB: which model elements a prose document is about.
 
     docmem align --kb KBDB --model MODELDB --model-name apollo11 --out ALIGNDIR
+    docmem align --from-provenance --kb KBDB --model MODELDB --model-name NAME --corpus DIR --out ALIGNDIR
+        (the links the model states itself: each element's @Provenance source, no scoring; see align_provenance)
     docmem ask --db KBDB --with-model ALIGNDIR --model-db MODELDB "question"
     docmem ask --db MODELDB --with-prose ALIGNDIR --prose-db KBDB "question"
 
@@ -30,8 +32,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 
@@ -259,7 +262,8 @@ async def _model_elements(graph, vector, model_name: str):
         elements.append({"section_id": str(s["id"]), "qname": "::".join(p[1].strip("'") for p in parsed),
                          "kind": parsed[-1][0], "metaclass": metaclass_for(parsed[-1][0])[0] or "",
                          "name": parsed[-1][1].strip("'"), "uri": s["name"],
-                         "line": s.get("line"), "path": s["path"], "passages": []})
+                         "line": s.get("line"), "path": s["path"], "passages": [],
+                         "offset": int(s["offset"]), "length": int(s["length"])})
     sids = [e["section_id"] for e in elements]
     pairs = await graph.query(
         "MATCH (p:Node)-[r:EDGE]->(s:Node) WHERE r.relationship_name = 'section' AND s.id IN $sids "
@@ -587,7 +591,28 @@ def align_main(argv=None):
                     help="elements with no direct alignment inherit their model relations' documents (satisfied "
                          "by, typed by, specializes, usage of, owned by): decay 0.8 per link, at most 2 links, "
                          "3 documents each (default on)")
+    ap.add_argument("--from-provenance", action="store_true",
+                    help="align from the model's own @Provenance sources instead of scoring: each source names a "
+                         "prose file and an anchor (a heading or a code symbol); no weights, threshold or propagation")
+    ap.add_argument("--corpus", type=Path, help="(with --from-provenance) the directory the prose was scanned from; "
+                                                "a source's path is read relative to it")
+    ap.add_argument("--repo", help="(with --from-provenance) only sources of this repo@commit, e.g. "
+                                   "nanos3reader@ff28f0b; other sources are counted and skipped")
     a = ap.parse_args(argv)
+    if a.from_provenance:
+        if a.corpus is None:
+            ap.error("--from-provenance needs --corpus")
+        m = align_provenance(a.kb, a.model, a.model_name, a.corpus, a.repo, a.out)
+        print(f"elements {m['elements']}, with a @Provenance {m['elements_with_provenance']}, aligned "
+              f"{m['aligned_elements']}, rows {m['rows']}, documents {m['documents']}, {m['seconds']}s")
+        print("annotations:", json.dumps(m["counts"]))
+        print("anchor forms:", json.dumps(m["anchor_forms"]))
+        if m["unmapped_sources"]:
+            print("sources whose file is not in the KB:", ", ".join(m["unmapped_sources"]))
+        print("by kind (elements / with provenance / aligned):")
+        for k, v in list(m["by_kind"].items())[:25]:
+            print(f"  {k:24s} {v['elements']:5d} {v['with_provenance']:5d} {v['aligned']:5d}")
+        return
     weights = {k.strip(): float(v) for k, v in (x.split("=") for x in a.weights.split(","))}
     if set(weights) != set(WEIGHTS):
         raise SystemExit(f"docmem align --weights: name the signals {', '.join(WEIGHTS)}")
@@ -601,6 +626,200 @@ def align_main(argv=None):
     print("by kind (elements / aligned directly / aligned with propagation):")
     for k, v in list(m["by_kind"].items())[:25]:
         print(f"  {k:24s} {v['elements']:5d} {v['aligned']:5d} {v['aligned_total']:5d}")
+
+
+# -- provenance: the alignment the model states itself (no LLM) ----------------------------------------------------
+
+PROVENANCE = re.compile(rb"@Provenance\s*\{([^}]*)\}")
+_ATTR = re.compile(rb'(\w+)\s*=\s*"((?:[^"\\]|\\.)*)"')
+_SOURCE = re.compile(r"^(?P<repo>[^:#]+):(?P<path>[^#]+)(?:#(?P<anchor>.+))?$")
+_KEYWORDS = {"if", "while", "for", "return", "switch", "else", "do", "catch", "case", "sizeof", "new", "delete"}
+# how precisely an anchor named its passages: a heading or the symbol's own declaration is the element itself
+ANCHOR_SCORE = {"file": 0.8, "heading": 1.0, "definition": 1.0, "mention": 0.9, "anchor-unmatched": 0.7}
+
+
+def provenance_annotations(data: bytes) -> list[dict]:
+    """The @Provenance annotations of one model file: byte offset, source and maturity. An annotation with no
+    source is a model error and raises."""
+    out = []
+    for m in PROVENANCE.finditer(data):
+        attrs = {k.decode(): v.decode("utf-8", "replace") for k, v in _ATTR.findall(m.group(1))}
+        if "source" not in attrs:
+            raise ValueError(f"@Provenance at byte {m.start()} has no source")
+        out.append({"offset": m.start(), "source": attrs["source"], "maturity": attrs.get("maturity", "")})
+    return out
+
+
+def parse_source(source: str) -> tuple[str, str, str | None]:
+    """(repo@commit, path, anchor or None): "nanos3reader@ff28f0b:src/s3_reader.cpp#load_window" splits so."""
+    m = _SOURCE.match(source)
+    if not m:
+        raise ValueError(f"@Provenance source {source!r} is not repo@commit:path[#anchor]")
+    return m["repo"], m["path"], m["anchor"]
+
+
+def heading_slug(title: str) -> str:
+    """The GitHub anchor of a markdown heading: lowercase, punctuation dropped, each space a hyphen
+    ("Scope & non-goals" -> "scope--non-goals")."""
+    return re.sub(r"[^\w\- ]", "", title.strip().lower()).replace(" ", "-")
+
+
+def owner_of(elements: list[dict], uri: str, offset: int) -> dict | None:
+    """The innermost element of the file ``uri`` whose declaration, body included, covers the byte offset."""
+    owners = [e for e in elements if e["uri"] == uri and e["offset"] <= offset < e["offset"] + e["length"]]
+    return max(owners, key=lambda e: e["offset"], default=None)
+
+
+_TYPE_PREFIX = re.compile(r"[\w:<>*&~,\s]+")  # what may stand before a function name in its definition: a return type
+
+
+def _is_definition(text: str, ident: str) -> bool:
+    """A line that declares ``ident``: a class, struct or namespace of that name, or a function definition: the
+    name is called with a return type (or a class qualifier) before it, and the line does not end in ';'. A call
+    in an expression (``x = ns::f(``), a comment or an if/while line is not a definition."""
+    if re.match(rf"\s*(?:template\s*<[^>]*>\s*)?(?:class|struct|namespace)\s+{re.escape(ident)}\b[^;]*$", text):
+        return True
+    first = re.match(r"\s*(\w+)", text)
+    if first and first.group(1) in _KEYWORDS:
+        return False
+    m = re.search(rf"(?<![\w.>]){re.escape(ident)}\s*\(", text)
+    if not m or text.rstrip().endswith(";"):
+        return False
+    prefix = text[:m.start()]
+    return bool(prefix.strip()) and _TYPE_PREFIX.fullmatch(prefix) is not None
+
+
+def resolve_anchor(passages: list[dict], lines: list[str], anchor: str | None) -> tuple[str, list[str]]:
+    """The passage ids an anchor names, and how it matched. ``passages``: {id, path, line, end_line} of one document;
+    ``lines``: the document's file, split at "\\n" (line n is lines[n - 1]).
+
+    file               no anchor: the whole document
+    heading            a markdown heading whose GitHub slug is the anchor: the passages of that section
+    definition         code: the passages holding the symbol's declaration (a qualified name is searched whole when
+                       the file has it, else by its last part)
+    mention            code: the passages where the symbol occurs, when it is not declared there
+    anchor-unmatched   nothing found: the whole document, at a lower score
+    """
+    if anchor is None:
+        return "file", [p["id"] for p in passages]
+    titles = {p["path"].split(SECTION_SEP)[-1] for p in passages}
+    slugs = {t for t in titles if heading_slug(t) == anchor}
+    if slugs:
+        return "heading", [p["id"] for p in passages if p["path"].split(SECTION_SEP)[-1] in slugs]
+    texts = {p["id"]: lines[p["line"] - 1:p["end_line"]] for p in passages}
+    qualified_in_file = "::" in anchor and any(anchor in x for ls in texts.values() for x in ls)
+    ident = anchor.rpartition("::")[2] if "::" in anchor and not qualified_in_file else anchor
+    word = re.compile(rf"(?<!\w){re.escape(ident)}(?!\w)")
+    defs = [pid for pid, ls in texts.items() if any(_is_definition(x, ident) for x in ls)]
+    if defs:
+        return "definition", [p["id"] for p in passages if p["id"] in defs]
+    mentions = [p["id"] for p in passages if any(word.search(x) for x in texts[p["id"]])]
+    if mentions:
+        return "mention", [p["id"] for p in passages if p["id"] in mentions]
+    return "anchor-unmatched", [p["id"] for p in passages]
+
+
+def _uri_path(uri: str) -> Path:
+    u = urlparse(uri)
+    return Path(unquote(u.path))
+
+
+def align_provenance(kb: Path, model: Path, model_name: str, corpus: Path, repo: str | None, out: Path) -> dict:
+    """Write the alignment the model states itself: each element with a @Provenance annotation to the prose passages
+    its source names (ALIGNDIR/alignment.jsonl, signal "provenance", one row per element and document; meta.json with
+    the counts). The annotation belongs to the innermost element whose body holds it. A source is read as
+    ``corpus/<path>`` (the prose the KB was scanned from) and its anchor as a heading slug or a code symbol.
+    Reads the model DB and the KB through child processes and the .sysml and prose files; no LLM, no vectors."""
+    started = time.time()
+    out.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=".work-", dir=out))
+    try:
+        _child(["export-model", "--db", model, "--model-name", model_name, "--out", work])
+        elements = json.loads((work / "model.json").read_text())["elements"]
+        (work / "queries.json").write_text("[]")
+        _child(["export-kb", "--db", kb, "--queries", work / "queries.json", "--out", work])
+        kj = json.loads((work / "kb.json").read_text())
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    docs = {d["uri"]: d for d in kj["docs"]}
+    passages_of_doc = defaultdict(list)
+    for p in kj["passages"]:
+        passages_of_doc[p["uri"]].append(p)
+    lines_of: dict[str, list[str]] = {}
+    elements_of_file = defaultdict(list)
+    for e in elements:
+        elements_of_file[e["uri"]].append(e)
+    stats, anchor_forms, unmapped, annotated = Counter(), Counter(), [], set()
+    rows: dict[tuple[str, str], dict] = {}
+    for file_uri in sorted(elements_of_file):
+        for ann in provenance_annotations(_uri_path(file_uri).read_bytes()):
+            stats["annotations"] += 1
+            owner = owner_of(elements_of_file[file_uri], file_uri, ann["offset"])
+            if owner is None:
+                stats["no_owner"] += 1
+                continue
+            src_repo, rel, anchor = parse_source(ann["source"])
+            if repo and src_repo != repo:
+                stats["other_repo"] += 1
+                continue
+            doc_uri = (corpus / rel).resolve().as_uri()
+            if doc_uri not in docs:
+                stats["doc_not_in_kb"] += 1
+                unmapped.append(ann["source"])
+                continue
+            if anchor is None:
+                form = "file only"
+            elif "::" in anchor:
+                form = "qualified identifier"
+            elif re.fullmatch(r"[A-Za-z_]\w*", anchor):
+                form = "identifier (or one-word slug)"
+            else:
+                form = "hyphenated (heading slug)"
+            anchor_forms[form] += 1
+            if doc_uri not in lines_of:
+                lines_of[doc_uri] = _uri_path(doc_uri).read_text(encoding="utf-8", errors="replace").split("\n")
+            mode, pids = resolve_anchor(passages_of_doc[doc_uri], lines_of[doc_uri], anchor)
+            stats[f"anchor {mode}"] += 1
+            annotated.add(owner["section_id"])
+            row = rows.get((owner["section_id"], doc_uri))
+            if row is None:
+                row = rows[(owner["section_id"], doc_uri)] = {
+                    "element": owner["qname"], "section_id": owner["section_id"], "kind": owner["kind"],
+                    "metaclass": owner["metaclass"], "model_uri": owner["uri"], "model_line": owner["line"],
+                    "model_path": owner["path"], "doc": docs[doc_uri]["title"], "uri": doc_uri,
+                    "url": docs[doc_uri]["url"], "score": 0.0, "signals": {"provenance": 1.0}, "passages": [],
+                    "basis": "provenance", "signal": "provenance", "anchor_mode": mode, "sources": [],
+                    "maturities": []}
+            row["passages"] += pids
+            row["sources"].append(ann["source"])
+            row["maturities"].append(ann["maturity"])
+            if ANCHOR_SCORE[mode] >= row["score"]:
+                row["score"], row["anchor_mode"] = ANCHOR_SCORE[mode], mode
+    lines_out = []
+    for row in sorted(rows.values(), key=lambda r: (r["model_path"], r["uri"])):
+        row["passages"] = list(dict.fromkeys(row["passages"]))
+        row["score"] = round(row["score"], 4)
+        lines_out.append(row)
+    aligned = {r["section_id"] for r in lines_out}
+    by_kind = defaultdict(lambda: {"elements": 0, "with_provenance": 0, "aligned": 0})
+    for e in elements:
+        k = by_kind[e["kind"]]
+        k["elements"] += 1
+        k["with_provenance"] += e["section_id"] in annotated
+        k["aligned"] += e["section_id"] in aligned
+    (out / "alignment.jsonl").write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines_out))
+    meta = {
+        "mode": "provenance", "kb": str(kb), "model": str(model), "model_name": model_name,
+        "corpus": str(corpus), "repo": repo, "elements": len(elements),
+        "elements_with_provenance": len(annotated), "aligned_elements": len(aligned), "rows": len(lines_out),
+        "documents": len(kj["docs"]), "kb_passages": len(kj["passages"]), "counts": dict(stats),
+        "anchor_forms": dict(anchor_forms), "unmapped_sources": sorted(set(unmapped)),
+        "by_kind": {k: dict(v) for k, v in sorted(by_kind.items(), key=lambda kv: -kv[1]["elements"])},
+        "seconds": round(time.time() - started, 1),
+    }
+    (out / "meta.json").write_text(json.dumps(meta, indent=1, ensure_ascii=False) + "\n")
+    return meta
 
 
 # -- ask: the aligned items for a question's hits ----------------------------------------------------------------

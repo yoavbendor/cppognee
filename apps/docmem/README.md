@@ -337,3 +337,22 @@ docmem ask --db MODELDB --with-prose ALIGNDIR --prose-db KBDB "question"   # mod
   by their centroid, prose passages by their vectors); `--aligned N` items each. Items are marked `found_by`:
   `alignment` (stored rows), `query`, or `alignment+query`. `--no-query-align` keeps only the stored alignment.
 - **Coverage:** `meta.json` and the `align` output count elements aligned directly and with propagation, per kind.
+
+### From the model's own provenance (`align --from-provenance`)
+
+A model that cites its sources (`@Provenance { source = "repo@commit:path#anchor"; }`) states its alignment itself, so
+no scoring is needed:
+
+```sh
+docmem scan ~/repo --ext .h,.cpp,.yml,.cmake --name CMakeLists.txt --include-hidden | docmem index --db ~/kb
+docmem align --from-provenance --kb ~/kb --model ~/model_db --model-name NAME --corpus ~/repo --repo repo@commit --out ALIGNDIR
+```
+
+- **Owner:** an annotation belongs to the innermost model element whose declaration holds it.
+- **Anchor:** a markdown heading slug (`#scope--non-goals`) names that section's passages (`heading`); a code symbol
+  names the passages where it is declared (`definition`) or, failing that, mentioned (`mention`); no anchor names the
+  whole file (`file`); an anchor found nowhere gives the whole document at a lower score (`anchor-unmatched`).
+- **Rows:** signal `provenance`, one row per element and document, as `align` writes them, so `ask --with-model` reads
+  them unchanged. `meta.json` counts the annotations, the anchor forms and the sources whose file is not in the KB.
+- **Code and text files** (`scan --ext`, `--name`) are cut with no heading detection, so a `#` comment in CMake or YAML
+  is not a section; their passage path is the file name. `--include-hidden` reads hidden directories such as `.github`.
