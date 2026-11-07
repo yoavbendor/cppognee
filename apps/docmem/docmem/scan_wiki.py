@@ -517,7 +517,7 @@ def titles_selection(source: DumpSource, titles: list[tuple[str, str]], out, tar
             continue
         art = article_of(pages[located[title][1]])
         if art is None:
-            log(f"not an article (namespace 0, not a redirect): {title!r}")
+            log(f"not an article (a redirect, another namespace or empty): {title!r}")
             continue
         uris.append(emit(out, art, target_words, max_words, field=field or None))
     return uris
