@@ -35,11 +35,17 @@ def source_name(h) -> str:
     return store.uri_path(h["uri"]).name if h["uri"].startswith("file:") else h["path"].split(" › ")[0]
 
 
+def heading_in(path: str, heading: str) -> bool:
+    """The heading is one segment of the path (case-insensitive). A model item's path segments are its labels
+    ("model › apollo11 › package P › part def ApolloLunarModule"), so its heading is e.g. "part def ApolloLunarModule"."""
+    return heading.strip().lower() in [p.strip().lower() for p in path.split("›")]
+
+
 def source_rank(hits, src) -> int | None:
+    """The rank of the first hit (prose or model, aligned or retrieved) in the source's file whose heading path has
+    the source's heading; None when no hit does. Hits are the whole context, not only the top k."""
     for h in hits:
-        if source_name(h) == src["file"] and (
-                not src.get("heading") or src["heading"].strip().lower() in
-                [p.strip().lower() for p in h["path"].split("›")]):
+        if source_name(h) == src["file"] and (not src.get("heading") or heading_in(h["path"], src["heading"])):
             return h["rank"]
     return None
 
@@ -93,12 +99,15 @@ def summarize(rows, a, usage):
          "hops": a.hops, "links": a.links, "terms": a.terms, "concepts": a.concepts, "pivot": a.pivot}
     if a.hops:
         s.update({"hop_k": a.hop_k, "max_passages": a.max_passages})
+    if a.with_model or a.with_prose:
+        s.update({"with_model": str(a.with_model or ""), "with_prose": str(a.with_prose or ""), "aligned": a.aligned})
     if a.pivot:
         s.update({"pivot_scheme": a.pivot_scheme or "all", "pivot_concepts_per_question": a.pivot_concepts})
     for k in sorted({1, 3, a.k}):
         s[f"hit@{k}"] = round(sum(1 for r in ans if r["first_rank"] and r["first_rank"] <= k) / max(len(ans), 1), 3)
     s["mrr"] = round(sum(1 / r["first_rank"] for r in ans if r["first_rank"]) / max(len(ans), 1), 3)
-    gathered = ("all sources gathered" if (a.hops or a.links or a.terms or a.split or a.concepts or a.pivot)
+    gathered = ("all sources gathered" if (a.hops or a.links or a.terms or a.split or a.concepts or a.pivot
+                                           or a.with_model or a.with_prose)
                 else f"all sources in top {a.k}")
     for kind in sorted({r["kind"] for r in ans}):
         rs = [r for r in ans if r["kind"] == kind]

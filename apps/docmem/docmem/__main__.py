@@ -8,6 +8,7 @@ USAGE = """usage: docmem <command> ...
   model-resolve  resolve a model DB's references to qualified names; write the edges and metaclasses (no LLM)
   model-show     one model element: metaclass, owner, types, owned and inherited features
   model-export   a model DB's resolved model as a nomograph index (for sysmldiag and nomograph-sysml)
+  align      link model elements to prose documents: a third store, no LLM (ALIGNDIR)
   model-check    nomograph-sysml's completeness checks on a model, stored as findings in the model DB
   model-gaps     the stored model findings, by check and under a qualified name
   index  store a scan's stream (stdin) in cognee: vectors and provenance, no text
@@ -46,6 +47,8 @@ def main():
         from .model_check import check_main as m
     elif cmd == "model-gaps":
         from .model_check import gaps_main as m
+    elif cmd == "align":
+        from .align import align_main as m
     elif cmd == "index":
         from .index import main as m
     elif cmd == "ask":

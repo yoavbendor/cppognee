@@ -411,7 +411,9 @@ def where(h) -> str:
 
 
 def label(h) -> str:
-    return f"{where(h)} — {h['path']}"
+    """Where an excerpt is from: its file and lines and heading path; an aligned item names its kind first."""
+    kind = f"{h['aligned']}: " if h.get("aligned") else ""
+    return f"{kind}{where(h)} — {h['path']}"
 
 
 def excerpts(hits) -> str:
@@ -500,6 +502,14 @@ async def ask_one(question: str, a, chat):
     if a.rerank and chat:
         hits = rerank(chat, question, hits, a.k)
         timing["rerank_s"] = round(time.time() - t, 2)
+    if a.with_model or a.with_prose:
+        from . import align
+
+        t = time.time()
+        hits = hits + align.aligned_items(hits, a)
+        for i, h in enumerate(hits, 1):
+            h["rank"] = i
+        timing["aligned_s"] = round(time.time() - t, 2)
     text = None
     searches = []
     if chat:
@@ -567,6 +577,16 @@ def add_common(ap):
     ap.add_argument("--hop-k", type=int, default=3, help="passages retrieved per follow-up SEARCH query")
     ap.add_argument("--max-passages", type=int, default=10,
                     help="cap on the passages given to the model in total (multi-hop)")
+    ap.add_argument("--with-model", type=Path, metavar="ALIGNDIR",
+                    help="(prose DB) also add the model elements aligned to the hits' documents, their text read "
+                         "from --model-db; no LLM; docmem align builds ALIGNDIR")
+    ap.add_argument("--model-db", type=Path, help="the model DB --with-model reads the elements from")
+    ap.add_argument("--with-prose", type=Path, metavar="ALIGNDIR",
+                    help="(model DB) also add the prose passages aligned to the hits' elements, read from "
+                         "--prose-db; no LLM")
+    ap.add_argument("--prose-db", type=Path, help="the prose KB --with-prose reads the passages from")
+    ap.add_argument("--aligned", type=int, default=5, metavar="N",
+                    help="at most N aligned items of each kind added per question")
 
 
 def open_db(a):
@@ -574,6 +594,10 @@ def open_db(a):
         raise SystemExit("docmem: --hops must be 0 or more; --hop-k and --max-passages at least 1")
     if a.pivot < 0 or a.pivot_concepts < 1:
         raise SystemExit("docmem: --pivot must be 0 or more; --pivot-concepts at least 1")
+    if a.with_model and not a.model_db:
+        raise SystemExit("docmem ask: --with-model needs --model-db")
+    if a.with_prose and not a.prose_db:
+        raise SystemExit("docmem ask: --with-prose needs --prose-db")
     store.configure(a.db, api_base=a.api_base or os.environ.get("DOCMEM_API_BASE"),
                     api_key=a.api_key or os.environ.get("DOCMEM_API_KEY"))
     from .llm import Chat
@@ -604,7 +628,8 @@ def main(argv=None):
         if h.get("via"):
             flag += f"  [linked via {', '.join(h['via'][:3])}]"
         link = f"{store.uri_path(h['uri'])}#L{h['line']}" if h["uri"].startswith("file:") else h["uri"]
-        dist = f"{h['distance']:.3f}" if h.get('distance') is not None else "  kw "
+        dist = (f"{h['distance']:.3f}" if h.get('distance') is not None
+                else ("  aln " if h.get("aligned") else "  kw "))
         print(f"[{i}] {dist}  {label(h)}{flag}\n     {link}")
     print(f"\n{json.dumps(r['timing'])} calls={r['calls']}", file=sys.stderr)
 
