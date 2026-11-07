@@ -202,7 +202,7 @@ def target(kind: str, name: str):
 
 def self_target(doc: dict):
     """The DocTarget a document itself answers to: its wiki title, else its URI."""
-    if doc.get("extractor") == "wikiplain/1":
+    if str(doc.get("extractor", "")).startswith("wikiplain/"):
         return target("wiki", doc["title"])
     return target("file", doc["uri"])
 
