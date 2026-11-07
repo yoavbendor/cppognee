@@ -116,3 +116,86 @@ def test_aligned_model_item_is_labelled_as_model():
             "path": "model › apollo11 › package P › part def ApolloLunarModule", "aligned": "model"}
     assert ask.label(item).startswith("model: TechnicalComponentsPackage.sysml:99-110")
     assert ask.label({**item, "aligned": None}).startswith("TechnicalComponentsPackage.sysml:99-110")
+
+
+# -- propagation through model relations (no cognee) ---------------------------------------------------------------
+
+from docmem.align import DECAY, KEEP_PROPAGATED, MAX_HOPS, model_links, propagate  # noqa: E402
+
+
+def _entry(score, passages=("p",)):
+    return {"score": score, "signals": {}, "passages": list(passages)}
+
+
+def _el(sid, qname, kind, metaclass=""):
+    return {"section_id": sid, "qname": qname, "kind": kind, "metaclass": metaclass}
+
+
+def test_propagate_takes_the_source_documents_with_decay_and_a_path():
+    direct = {0: {7: _entry(0.5)}}  # element 0 is aligned to doc 7
+    prop = propagate(direct, [(1, 0, "satisfied by")])
+    assert set(prop) == {1}
+    assert prop[1][7]["score"] == round(0.5 * DECAY, 4)
+    assert prop[1][7]["origin"] == 0
+    assert prop[1][7]["path"] == [{"rule": "satisfied by", "from": 0, "to": 1}]
+
+
+def test_propagate_never_overwrites_direct_rows_or_feeds_them():
+    direct = {0: {7: _entry(0.5)}, 1: {8: _entry(0.4)}}
+    prop = propagate(direct, [(1, 0, "owned by"), (0, 1, "owned by")])
+    assert prop == {}  # both elements have direct rows: neither takes anything
+
+
+def test_propagate_ownership_gives_a_child_its_owners_documents():
+    direct = {0: {3: _entry(0.6)}}  # the owner (a part def) is aligned
+    prop = propagate(direct, [(1, 0, "owned by"), (2, 1, "owned by")])
+    assert prop[1][3]["score"] == round(0.6 * DECAY, 4)
+    # the grandchild is two hops away: decayed twice
+    assert prop[2][3]["score"] == round(0.6 * DECAY * DECAY, 4)
+    assert len(prop[2][3]["path"]) == 2
+
+
+def test_propagate_stops_after_max_hops():
+    direct = {0: {3: _entry(0.9)}}
+    links = [(1, 0, "typed by"), (2, 1, "typed by"), (3, 2, "typed by")]
+    prop = propagate(direct, links)
+    assert 1 in prop and 2 in prop and 3 not in prop
+    assert MAX_HOPS == 2
+
+
+def test_propagate_score_never_exceeds_the_source_score():
+    direct = {0: {3: _entry(0.9)}, 1: {4: _entry(0.2)}}
+    prop = propagate(direct, [(2, 0, "satisfied by"), (2, 1, "satisfied by")])
+    for d, v in prop[2].items():  # never above the direct score it is inherited from
+        assert v["score"] <= direct[v["origin"]][d]["score"]
+    assert prop[2][3]["score"] == round(0.9 * DECAY, 4)  # the better path wins
+    assert prop[2][4]["score"] == round(0.2 * DECAY, 4)
+
+
+def test_propagate_keeps_the_top_documents_per_element():
+    direct = {s: {d: _entry(0.4 + 0.01 * d) for d in range(5)} for s in (0,)}
+    prop = propagate(direct, [(1, 0, "owned by")])
+    assert len(prop[1]) == KEEP_PROPAGATED == 3
+    assert set(prop[1]) == {4, 3, 2}  # the three best documents
+
+
+def test_model_links_follow_satisfy_typing_specialization_ownership_and_usages():
+    els = [_el("s0", "P", "part def"),
+           _el("s1", "P::R", "requirement def", "RequirementDefinition"),
+           _el("s2", "P::R2", "requirement", "RequirementUsage"),
+           _el("s3", "P::A", "part def")]
+    rels = [{"rel": "r_satisfy", "src": "s3", "dst": "s1"},      # A satisfies R
+            {"rel": "r_typed_by", "src": "s2", "dst": "s1"},     # usage R2 typed by R
+            {"rel": "r_specializes", "src": "s3", "dst": "s0"}]  # A specializes P
+    links = set(model_links(els, rels))
+    assert (1, 3, "satisfied by") in links      # the requirement takes its satisfier's documents
+    assert (2, 1, "typed by") in links          # the usage takes its definition's documents
+    assert (1, 2, "usage of") in links          # the requirement def takes its usages'
+    assert (3, 0, "specializes") in links       # A takes P's documents
+    assert (1, 0, "owned by") in links          # P::R is owned by P (by qualified name)
+    assert (3, 0, "owned by") in links          # P::A too
+
+
+def test_model_links_ignore_relations_to_elements_not_in_the_model():
+    els = [_el("s0", "P", "part def")]
+    assert model_links(els, [{"rel": "r_typed_by", "src": "s0", "dst": "lib"}]) == []

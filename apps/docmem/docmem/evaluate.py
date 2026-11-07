@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import json
 import time
+from collections import Counter
 from pathlib import Path
 
 from . import ask, store
@@ -74,6 +75,7 @@ async def run(a):
                "stale_hits": sum(h["status"] != "ok" for h in hits), "timing": r["timing"],
                "seconds": round(time.time() - t, 2), "searches": r["searches"], "calls": r["calls"],
                "linked": r["linked"], "pivot_concepts": r["pivot_concepts"],
+               "aligned_found_by": dict(Counter(h["found_by"] for h in hits if h.get("found_by"))),
                "hits": [ask.label(h) for h in hits]}
         if chat:
             ans = r["answer"]

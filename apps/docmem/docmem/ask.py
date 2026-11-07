@@ -506,7 +506,7 @@ async def ask_one(question: str, a, chat):
         from . import align
 
         t = time.time()
-        hits = hits + align.aligned_items(hits, a)
+        hits = hits + align.aligned_items(question, hits, a)
         for i, h in enumerate(hits, 1):
             h["rank"] = i
         timing["aligned_s"] = round(time.time() - t, 2)
@@ -586,7 +586,10 @@ def add_common(ap):
                          "--prose-db; no LLM")
     ap.add_argument("--prose-db", type=Path, help="the prose KB --with-prose reads the passages from")
     ap.add_argument("--aligned", type=int, default=5, metavar="N",
-                    help="at most N aligned items of each kind added per question")
+                    help="at most N aligned items of each kind added per question, and N query items per source")
+    ap.add_argument("--no-query-align", action="store_true",
+                    help="with --with-model / --with-prose: only the stored alignment, no search of the other DB "
+                         "with the question")
 
 
 def open_db(a):
@@ -625,7 +628,9 @@ def main(argv=None):
         print(r["answer"], "\n")
     for i, h in enumerate(r["hits"], 1):
         flag = "" if h["status"] == "ok" else f"  [{h['status'].upper()}: re-run scan | index]"
-        if h.get("via"):
+        if h.get("found_by"):
+            flag += f"  [found by {h['found_by']}]"
+        elif h.get("via"):
             flag += f"  [linked via {', '.join(h['via'][:3])}]"
         link = f"{store.uri_path(h['uri'])}#L{h['line']}" if h["uri"].startswith("file:") else h["uri"]
         dist = (f"{h['distance']:.3f}" if h.get('distance') is not None

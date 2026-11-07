@@ -40,6 +40,9 @@ WEIGHTS = {"name": 0.5, "keyword": 0.2, "vector": 0.3}
 TOP = 3
 BM25_K = 50
 THRESHOLD = 0.35  # chosen from the score distribution (see meta.json): below ~0.3 most pairs share one word
+DECAY = 0.8  # score kept per model relation a document travels along (--propagate)
+MAX_HOPS = 2  # longest chain of model relations a propagated document may come along
+KEEP_PROPAGATED = 3  # documents kept per element that inherits them
 SECTION_SEP = " › "
 _LABEL = re.compile(r"^(?P<kind>.*?)\s+(?P<name>'(?:[^'\\]|\\.)*'|\S+)$")  # "part def Foo", "requirement 'clr-R1'"
 _BOUNDARY = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])")
@@ -148,6 +151,68 @@ def align_rows(elements: list[dict], docs: list[dict], kb_vecs: np.ndarray, pass
     return rows, best, {"bm25_scale": round(kw_scale, 4), "vector_baseline": round(baseline, 4)}
 
 
+def model_links(elements: list[dict], relations: list[dict]) -> list[tuple[int, int, str]]:
+    """(inheritor, source, rule) triples: the inheritor takes the documents of the source element.
+      satisfied by  a requirement takes its satisfier's documents (r_satisfy runs satisfier -> requirement)
+      typed by      a usage takes its definition's documents; specializes: a specialization takes its general's
+      usage of      a requirement definition takes its usages' documents (the reverse of typed by)
+      owned by      an element takes its owner's documents (the owner is the element named by its qualified name's prefix)
+    relations: {"rel": "r_satisfy" | "r_typed_by" | "r_specializes", "src": section id, "dst": section id}."""
+    index = {el["section_id"]: i for i, el in enumerate(elements)}
+    by_qname = defaultdict(list)
+    for i, el in enumerate(elements):
+        by_qname[el["qname"]].append(i)
+    links = []
+    for r in relations:
+        s, d = index.get(r["src"]), index.get(r["dst"])
+        if s is None or d is None:
+            continue
+        if r["rel"] == "r_satisfy":
+            links.append((d, s, "satisfied by"))
+        elif r["rel"] == "r_typed_by":
+            links.append((s, d, "typed by"))
+            if elements[d]["metaclass"] == "RequirementDefinition":
+                links.append((d, s, "usage of"))
+        elif r["rel"] == "r_specializes":
+            links.append((s, d, "specializes"))
+    for i, el in enumerate(elements):
+        for o in by_qname.get(el["qname"].rpartition("::")[0], []):
+            links.append((i, o, "owned by"))
+    return links
+
+
+def propagate(direct: dict, links: list[tuple[int, int, str]], decay: float = DECAY,
+              max_hops: int = MAX_HOPS, keep: int = KEEP_PROPAGATED) -> dict:
+    """The documents elements inherit from related elements, for elements with no direct row.
+
+    direct: {element: {doc: {"score", "signals", "passages"}}} (the alignment's rows). Round k takes the documents the
+    sources hold after round k-1, so a chain has at most max_hops links, and each link multiplies the score by decay:
+    a propagated score is below the direct score it comes from. An element with direct rows keeps them and takes
+    nothing. Returns {element: {doc: entry}} for the elements that got documents, at most keep each; an entry has the
+    score, the passages of the direct row it comes from, origin (that element) and path ([{rule, from, to}])."""
+    best = {e: {d: {**v, "origin": e, "path": []} for d, v in docs.items()} for e, docs in direct.items()}
+    inherits = defaultdict(list)
+    for inheritor, source, rule in links:
+        if inheritor != source and inheritor not in direct:
+            inherits[source].append((inheritor, rule))
+    for _ in range(max_hops):
+        held = {e: sorted(docs.items(), key=lambda kv: (-kv[1]["score"], kv[0]))[:keep]
+                for e, docs in best.items()}
+        for source, items in held.items():
+            for inheritor, rule in inherits.get(source, []):
+                for d, v in items:
+                    score = round(v["score"] * decay, 4)
+                    cur = best.setdefault(inheritor, {}).get(d)
+                    if cur is None or score > cur["score"]:
+                        best[inheritor][d] = {"score": score, "passages": v["passages"], "origin": v["origin"],
+                                              "path": v["path"] + [{"rule": rule, "from": source, "to": inheritor}]}
+    out = {}
+    for e, docs in best.items():
+        if e not in direct and docs:
+            out[e] = dict(sorted(docs.items(), key=lambda kv: (-kv[1]["score"], kv[0]))[:keep])
+    return out
+
+
 # -- child processes: read one store each ------------------------------------------------------------------------
 
 def _child(args: list[str], payload=None) -> str:
@@ -170,54 +235,73 @@ def _load_cfg(db: Path) -> dict:
     return json.loads((Path(db) / "docmem.json").read_text())
 
 
+RELATIONS = ("r_satisfy", "r_typed_by", "r_specializes")  # the model relations propagation follows
+
+
+async def _model_elements(graph, vector, model_name: str):
+    """The model's elements (one per labelled section of model_name, with the row indices of their passage vectors),
+    the count of unparsed sections, the passage vector matrix, and the model relations among the elements."""
+    from . import store
+    from .ontology import nodes_of_type
+    from .sysml_resolve import _relation_rows, metaclass_for
+
+    secs = [s for s in await nodes_of_type(graph, "DocSection")
+            if s.get("path", "").split(SECTION_SEP)[1:2] == [model_name]]
+    elements, unparsed = [], 0
+    for s in secs:
+        labels = s["path"].split(SECTION_SEP)[2:]
+        parsed = [parse_label(x) for x in labels]
+        if not labels:
+            continue
+        if any(p is None for p in parsed):
+            unparsed += 1
+            continue
+        elements.append({"section_id": str(s["id"]), "qname": "::".join(p[1].strip("'") for p in parsed),
+                         "kind": parsed[-1][0], "metaclass": metaclass_for(parsed[-1][0])[0] or "",
+                         "name": parsed[-1][1].strip("'"), "uri": s["name"],
+                         "line": s.get("line"), "path": s["path"], "passages": []})
+    sids = [e["section_id"] for e in elements]
+    pairs = await graph.query(
+        "MATCH (p:Node)-[r:EDGE]->(s:Node) WHERE r.relationship_name = 'section' AND s.id IN $sids "
+        "RETURN p.id, s.id", {"sids": sids}) if sids else []
+    by_sid = {e["section_id"]: e for e in elements}
+    pid_list = []
+    for pid, sid in pairs:
+        by_sid[str(sid)]["passages"].append(str(pid))
+        pid_list.append(str(pid))
+    vecs = {str(r.id): r.payload["vector"] for r in
+            (await vector.retrieve(store.PASSAGES, sorted(set(pid_list)), include_vector=True) if pid_list else [])}
+    mat, index = [], {}
+    for pid in sorted(vecs):
+        index[pid] = len(mat)
+        mat.append(vecs[pid])
+    for e in elements:
+        e["vec_rows"] = [index[p] for p in e.pop("passages") if p in index]
+    relations = []
+    sid_set = set(sids)
+    for rel in RELATIONS:
+        for a, b, _, _ in await _relation_rows(graph, rel):
+            if a in sid_set and b in sid_set:
+                relations.append({"rel": rel, "src": a, "dst": b})
+    return elements, unparsed, np.asarray(mat, dtype=np.float32).reshape(len(mat), -1), relations
+
+
 def _export_model(db: Path, model_name: str, out: Path) -> None:
     import asyncio
 
     from . import store
-    from .ontology import nodes_of_type
-    from .sysml_resolve import metaclass_for
 
     store.configure(db)
 
     async def go():
         graph, vector = await store.engines()
-        secs = [s for s in await nodes_of_type(graph, "DocSection")
-                if s.get("path", "").split(SECTION_SEP)[1:2] == [model_name]]
-        elements, unparsed = [], 0
-        for s in secs:
-            labels = s["path"].split(SECTION_SEP)[2:]
-            parsed = [parse_label(x) for x in labels]
-            if not labels:
-                continue
-            if any(p is None for p in parsed):
-                unparsed += 1
-                continue
-            elements.append({"section_id": str(s["id"]), "qname": "::".join(p[1].strip("'") for p in parsed),
-                             "kind": parsed[-1][0], "metaclass": metaclass_for(parsed[-1][0])[0] or "",
-                             "name": parsed[-1][1].strip("'"), "uri": s["name"],
-                             "line": s.get("line"), "path": s["path"], "passages": []})
-        sids = [e["section_id"] for e in elements]
-        pairs = await graph.query(
-            "MATCH (p:Node)-[r:EDGE]->(s:Node) WHERE r.relationship_name = 'section' AND s.id IN $sids "
-            "RETURN p.id, s.id", {"sids": sids}) if sids else []
-        by_sid = {e["section_id"]: e for e in elements}
-        pid_list = []
-        for pid, sid in pairs:
-            by_sid[str(sid)]["passages"].append(str(pid))
-            pid_list.append(str(pid))
-        vecs = {str(r.id): r.payload["vector"] for r in
-                (await vector.retrieve(store.PASSAGES, sorted(set(pid_list)), include_vector=True) if pid_list
-                 else [])}
-        mat, index = [], {}
-        for pid in sorted(vecs):
-            index[pid] = len(mat)
-            mat.append(vecs[pid])
-        for e in elements:
-            e["vec_rows"] = [index[p] for p in e.pop("passages") if p in index]
-        np.save(out / "model_vectors.npy", np.asarray(mat, dtype=np.float32).reshape(len(mat), -1))
+        elements, unparsed, mat, relations = await _model_elements(graph, vector, model_name)
+        np.save(out / "model_vectors.npy", mat)
         (out / "model.json").write_text(json.dumps({
-            "model_name": model_name, "elements": elements, "unparsed_sections": unparsed}, ensure_ascii=False))
-        print(json.dumps({"elements": len(elements), "unparsed": unparsed, "passages": len(index)}))
+            "model_name": model_name, "elements": elements, "unparsed_sections": unparsed,
+            "relations": relations}, ensure_ascii=False))
+        print(json.dumps({"elements": len(elements), "unparsed": unparsed, "passages": len(mat),
+                          "relations": len(relations)}))
 
     asyncio.run(go())
 
@@ -256,8 +340,24 @@ def _export_kb(db: Path, queries: list[str], out: Path) -> None:
     asyncio.run(go())
 
 
+async def _read_sections(graph, section_ids: list[str], max_bytes: int, db: Path) -> list[dict]:
+    """The model sections' text: each section's bytes in its .sysml file (cut at max_bytes)."""
+    from . import store
+
+    nodes = {str(n["id"]): store.node_props(n) for n in await graph.get_nodes(section_ids)}
+    out = []
+    for sid in section_ids:
+        n = nodes.get(sid)
+        if n is None:
+            raise SystemExit(f"docmem align: no section {sid} in {db}")
+        full, status = store.read_span(n["name"], int(n["offset"]), int(n["length"]))
+        text = full.encode("utf-8")[:max_bytes].decode("utf-8", "replace")
+        out.append({"id": sid, "uri": n["name"], "path": n["path"], "line": n["line"],
+                    "end_line": int(n["line"]) + full.count("\n"), "text": text, "status": status})
+    return out
+
+
 def _spans(db: Path, section_ids: list[str], max_bytes: int) -> list[dict]:
-    """The model elements' text: each section's bytes in its .sysml file (cut at max_bytes)."""
     import asyncio
 
     from . import store
@@ -266,17 +366,49 @@ def _spans(db: Path, section_ids: list[str], max_bytes: int) -> list[dict]:
 
     async def go():
         graph, _ = await store.engines()
-        nodes = {str(n["id"]): store.node_props(n) for n in await graph.get_nodes(section_ids)}
-        out = []
-        for sid in section_ids:
-            n = nodes.get(sid)
-            if n is None:
-                raise SystemExit(f"docmem align: no section {sid} in {db}")
-            full, status = store.read_span(n["name"], int(n["offset"]), int(n["length"]))
-            text = full.encode("utf-8")[:max_bytes].decode("utf-8", "replace")
-            out.append({"id": sid, "uri": n["name"], "path": n["path"], "line": n["line"],
-                        "end_line": int(n["line"]) + full.count("\n"), "text": text, "status": status})
-        return out
+        return await _read_sections(graph, section_ids, max_bytes, db)
+
+    return asyncio.run(go())
+
+
+def _query_model(db: Path, model_name: str, question: str, n: int, max_bytes: int) -> list[dict]:
+    """The n model elements nearest the question: the cosine between the question's vector and each element's centroid
+    (the normalized mean of its passage vectors, as align_rows does). Each comes with its text and score; no threshold."""
+    import asyncio
+
+    from . import store
+
+    store.configure(db)
+
+    async def go():
+        graph, vector = await store.engines()
+        elements, _, mat, _ = await _model_elements(graph, vector, model_name)
+        have = [e for e in elements if e["vec_rows"]]
+        if not have:
+            return []
+        q = np.asarray((await vector.embedding_engine.embed_text([question]))[0], dtype=np.float32)
+        q /= np.linalg.norm(q) or 1
+        cent = _normalize(np.stack([mat[e["vec_rows"]].mean(axis=0) for e in have]))
+        sims = cent @ q
+        order = np.argsort(-sims, kind="stable")[:n]
+        picks = [have[i] for i in order]
+        spans = await _read_sections(graph, [e["section_id"] for e in picks], max_bytes, db)
+        return [{**sp, "score": round(float(sims[i]), 4)} for sp, i in zip(spans, order)]
+
+    return asyncio.run(go())
+
+
+def _query_prose(db: Path, question: str, n: int, max_bytes: int) -> list[dict]:
+    """The n prose passages nearest the question (ask's retrieval), with their text read as ask reads them."""
+    import asyncio
+
+    from . import ask, store
+
+    store.configure(db)
+
+    async def go():
+        hits, _ = await ask.retrieve(question, n)
+        return ask.read_hits(hits, "passage", max_bytes)
 
     return asyncio.run(go())
 
@@ -312,6 +444,11 @@ def child_main(argv: list[str]) -> None:
     sp.add_argument("--db", type=Path, required=True)
     pr = sub.add_parser("prose", help="prose passages (ids on stdin) -> hits with their text")
     pr.add_argument("--db", type=Path, required=True)
+    qm = sub.add_parser("query-model", help="question (stdin) -> the nearest model elements with their text")
+    qm.add_argument("--db", type=Path, required=True)
+    qm.add_argument("--model-name", required=True)
+    qp = sub.add_parser("query-prose", help="question (stdin) -> the nearest prose passages with their text")
+    qp.add_argument("--db", type=Path, required=True)
     a = ap.parse_args(argv)
     if a.cmd == "export-model":
         _export_model(a.db, a.model_name, a.out)
@@ -321,6 +458,10 @@ def child_main(argv: list[str]) -> None:
         req = json.loads(sys.stdin.read())
         if a.cmd == "spans":
             res = _spans(a.db, req["section_ids"], req["max_bytes"])
+        elif a.cmd == "query-model":
+            res = _query_model(a.db, a.model_name, req["question"], req["n"], req["max_bytes"])
+        elif a.cmd == "query-prose":
+            res = _query_prose(a.db, req["question"], req["n"], req["max_bytes"])
         else:
             res = _prose(a.db, req["passage_ids"], req["max_bytes"])
         print(json.dumps(res, ensure_ascii=False))
@@ -329,7 +470,7 @@ def child_main(argv: list[str]) -> None:
 # -- the alignment -----------------------------------------------------------------------------------------------
 
 def align(kb: Path, model: Path, model_name: str, out: Path, weights: dict, top: int, threshold: float,
-          bm25_k: int = BM25_K) -> dict:
+          bm25_k: int = BM25_K, propagation: bool = True) -> dict:
     kb_cfg, model_cfg = _load_cfg(kb), _load_cfg(model)
     if kb_cfg["embed"] != model_cfg["embed"] or kb_cfg["dims"] != model_cfg["dims"]:
         raise SystemExit(f"docmem align: the KB uses {kb_cfg['embed']} and the model {model_cfg['embed']}; "
@@ -360,37 +501,68 @@ def align(kb: Path, model: Path, model_name: str, out: Path, weights: dict, top:
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
-    lines, by_kind = [], defaultdict(lambda: {"elements": 0, "aligned": set()})
-    aligned_ids = set()
+    direct = defaultdict(dict)
     for e, d, score, signals, pids in rows:
+        direct[e][d] = {"score": score, "signals": signals, "passages": pids}
+    prop = propagate(direct, model_links(elements, mj["relations"])) if propagation else {}
+
+    def line(e, d, entry, basis):
         el, doc = elements[e], kj["docs"][d]
-        aligned_ids.add(el["section_id"])
-        lines.append({"element": el["qname"], "section_id": el["section_id"], "kind": el["kind"],
-                      "metaclass": el["metaclass"],
-                      "model_uri": el["uri"], "model_line": el["line"], "model_path": el["path"],
-                      "doc": doc["title"], "uri": doc["uri"], "url": doc["url"], "score": score,
-                      "signals": signals, "passages": pids})
+        out_ = {"element": el["qname"], "section_id": el["section_id"], "kind": el["kind"],
+                "metaclass": el["metaclass"], "model_uri": el["uri"], "model_line": el["line"],
+                "model_path": el["path"], "doc": doc["title"], "uri": doc["uri"], "url": doc["url"],
+                "score": entry["score"], "signals": entry.get("signals", {}), "passages": entry["passages"],
+                "basis": basis}
+        if basis == "propagated":
+            out_["origin"] = elements[entry["origin"]]["qname"]
+            out_["path"] = [{"rule": x["rule"], "from": elements[x["from"]]["qname"],
+                             "to": elements[x["to"]]["qname"]} for x in entry["path"]]
+            out_["hops"] = len(entry["path"])
+            out_["signals"] = {}
+        return out_
+
+    lines = [line(e, d, {"signals": signals, "passages": pids, "score": score}, "direct")
+             for e, d, score, signals, pids in rows]
+    for e in sorted(prop):
+        for d, entry in prop[e].items():
+            lines.append(line(e, d, entry, "propagated"))
+    direct_ids = {elements[e]["section_id"] for e in direct}
+    prop_ids = {elements[e]["section_id"] for e in prop}
+    by_kind = defaultdict(lambda: {"elements": 0, "direct": set(), "total": set()})
     for el in elements:
-        by_kind[el["kind"]]["elements"] += 1
-        if el["section_id"] in aligned_ids:
-            by_kind[el["kind"]]["aligned"].add(el["section_id"])
+        k = by_kind[el["kind"]]
+        k["elements"] += 1
+        if el["section_id"] in direct_ids:
+            k["direct"].add(el["section_id"])
+        if el["section_id"] in direct_ids | prop_ids:
+            k["total"].add(el["section_id"])
     (out / "alignment.jsonl").write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines))
     meta = {
         "kb": str(kb), "model": str(model), "model_name": model_name, "embed": kb_cfg["embed"],
         "dims": kb_cfg["dims"], "weights": weights, "top": top, "threshold": threshold, "bm25_k": bm25_k,
+        "propagation": {"decay": DECAY, "max_hops": MAX_HOPS, "keep": KEEP_PROPAGATED} if propagation else None,
         "elements": len(elements), "unparsed_sections": mj["unparsed_sections"],
         "elements_with_passages": sum(1 for e in elements if e["vec_rows"]),
-        "aligned_elements": len(aligned_ids), "rows": len(lines),
+        "aligned_elements": len(direct_ids), "propagated_elements": len(prop_ids - direct_ids),
+        "aligned_elements_total": len(direct_ids | prop_ids),
+        "rows": len(lines), "propagated_rows": sum(1 for x in lines if x["basis"] == "propagated"),
         "documents": len(kj["docs"]), "kb_passages": len(passage_ids),
         "top_score_quantiles": quantiles(best),
         "elements_with_top_score_at_least": {str(t): sum(1 for b in best if b >= t)
                                              for t in (0.2, 0.25, 0.3, 0.35, 0.4, 0.5)},
-        "by_kind": {k: {"elements": v["elements"], "aligned": len(v["aligned"])}
+        "by_kind": {k: {"elements": v["elements"], "aligned": len(v["direct"]), "aligned_total": len(v["total"])}
                     for k, v in sorted(by_kind.items(), key=lambda kv: -kv[1]["elements"])},
         **scale, "seconds": round(time.time() - started, 1),
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=1, ensure_ascii=False) + "\n")
     return {"meta": meta, "rows": lines}
+
+
+def load_meta(aligndir: Path) -> dict:
+    path = Path(aligndir) / "meta.json"
+    if not path.exists():
+        raise SystemExit(f"docmem: no alignment at {aligndir} (run docmem align first)")
+    return json.loads(path.read_text())
 
 
 def load_rows(aligndir: Path) -> list[dict]:
@@ -411,19 +583,24 @@ def align_main(argv=None):
                     help="signal weights, name=..,keyword=..,vector=..")
     ap.add_argument("--top", type=int, default=TOP, help="prose documents kept per element")
     ap.add_argument("--threshold", type=float, default=THRESHOLD, help="minimum score of a kept pair")
+    ap.add_argument("--propagate", action=argparse.BooleanOptionalAction, default=True,
+                    help="elements with no direct alignment inherit their model relations' documents (satisfied "
+                         "by, typed by, specializes, usage of, owned by): decay 0.8 per link, at most 2 links, "
+                         "3 documents each (default on)")
     a = ap.parse_args(argv)
     weights = {k.strip(): float(v) for k, v in (x.split("=") for x in a.weights.split(","))}
     if set(weights) != set(WEIGHTS):
         raise SystemExit(f"docmem align --weights: name the signals {', '.join(WEIGHTS)}")
-    r = align(a.kb, a.model, a.model_name, a.out, weights, a.top, a.threshold)
+    r = align(a.kb, a.model, a.model_name, a.out, weights, a.top, a.threshold, propagation=a.propagate)
     m = r["meta"]
-    print(f"elements {m['elements']} ({m['elements_with_passages']} with passages), aligned {m['aligned_elements']}, "
-          f"rows {m['rows']}, documents {m['documents']}, {m['seconds']}s")
+    print(f"elements {m['elements']} ({m['elements_with_passages']} with passages), aligned directly "
+          f"{m['aligned_elements']}, propagated to {m['propagated_elements']} more, rows {m['rows']} "
+          f"({m['propagated_rows']} propagated), documents {m['documents']}, {m['seconds']}s")
     print("top score per element:", json.dumps(m["top_score_quantiles"]))
     print("elements whose top score reaches:", json.dumps(m["elements_with_top_score_at_least"]))
-    print("by kind (elements / aligned):")
+    print("by kind (elements / aligned directly / aligned with propagation):")
     for k, v in list(m["by_kind"].items())[:25]:
-        print(f"  {k:24s} {v['elements']:5d} {v['aligned']:5d}")
+        print(f"  {k:24s} {v['elements']:5d} {v['aligned']:5d} {v['aligned_total']:5d}")
 
 
 # -- ask: the aligned items for a question's hits ----------------------------------------------------------------
@@ -439,11 +616,24 @@ def _best_rows(rows: list[dict], n: int, key) -> list[dict]:
     return out[:n]
 
 
-def aligned_items(hits: list[dict], a) -> list[dict]:
-    """Items to add to a question's context (ask --with-model / --with-prose), read through a child process on
-    the other DB. Items are marked with "aligned": "model" or "prose"; at most a.aligned of each kind."""
-    have = {h["id"] for h in hits}
+def aligned_items(question: str, hits: list[dict], a) -> list[dict]:
+    """Items to add to a question's context (ask --with-model / --with-prose), read through a child process on the
+    other DB. Items are marked with "aligned": "model" or "prose", and "found_by": "alignment" (the stored rows of
+    the hits' documents, or of the hits' elements) or "query" (the question's nearest elements or passages, unless
+    --no-query-align). An item the query also finds is "alignment+query". At most a.aligned of each kind per source.
+    Nothing already in the context is added twice."""
+    taken = {h["id"]: None for h in hits}  # id -> the added item (None: already a hit)
     items = []
+
+    def add(item: dict, found_by: str) -> None:
+        if item["id"] in taken:
+            if taken[item["id"]] is not None and found_by == "query":
+                taken[item["id"]]["found_by"] = "alignment+query"
+            return
+        item["found_by"] = found_by
+        taken[item["id"]] = item
+        items.append(item)
+
     if a.with_model:
         rows = load_rows(a.with_model)
         by_uri = defaultdict(list)
@@ -455,10 +645,16 @@ def aligned_items(hits: list[dict], a) -> list[dict]:
             spans = _child_json(["spans", "--db", a.model_db], {"section_ids": [r["section_id"] for r in pick],
                                                                   "max_bytes": a.max_bytes})
             for r, sp in zip(pick, spans):
-                items.append({"id": sp["id"], "uri": sp["uri"], "path": sp["path"], "line": sp["line"],
-                              "end_line": sp["end_line"], "text": sp["text"], "status": sp["status"],
-                              "distance": None, "aligned": "model",
-                              "via": [f"aligned to {r['doc']} (score {r['score']})"]})
+                add({"id": sp["id"], "uri": sp["uri"], "path": sp["path"], "line": sp["line"],
+                     "end_line": sp["end_line"], "text": sp["text"], "status": sp["status"],
+                     "distance": None, "aligned": "model",
+                     "via": [f"aligned to {r['doc']} (score {r['score']})"]}, "alignment")
+        if not a.no_query_align:
+            model_name = load_meta(a.with_model)["model_name"]
+            for g in _child_json(["query-model", "--db", a.model_db, "--model-name", model_name],
+                                 {"question": question, "n": a.aligned, "max_bytes": a.max_bytes}):
+                score = g.pop("score")
+                add({**g, "distance": None, "aligned": "model", "via": ["query"], "query_score": score}, "query")
     if a.with_prose:
         rows = load_rows(a.with_prose)
         by_key = defaultdict(list)
@@ -466,14 +662,18 @@ def aligned_items(hits: list[dict], a) -> list[dict]:
             by_key[(r["model_uri"], r["model_path"])].append(r)
         cands = [r for h in hits for r in by_key.get((h["uri"], h["path"]), []) if r["passages"]]
         pick = _best_rows(cands, a.aligned, lambda r: r["passages"][0])
-        pick = [r for r in pick if r["passages"][0] not in have]
+        pick = [r for r in pick if r["passages"][0] not in taken]
         if pick:
             got = {h["id"]: h for h in _child_json(["prose", "--db", a.prose_db], {
                 "passage_ids": [r["passages"][0] for r in pick], "max_bytes": a.max_bytes})}
             for r in pick:
                 if r["passages"][0] in got:
-                    items.append({**got[r["passages"][0]], "aligned": "prose",
-                                  "via": [f"aligned to {r['element']} (score {r['score']})"]})
+                    add({**got[r["passages"][0]], "aligned": "prose",
+                         "via": [f"aligned to {r['element']} (score {r['score']})"]}, "alignment")
+        if not a.no_query_align:
+            for g in _child_json(["query-prose", "--db", a.prose_db],
+                                 {"question": question, "n": a.aligned, "max_bytes": a.max_bytes}):
+                add({**g, "aligned": "prose", "via": ["query"]}, "query")
     return items
 
 
