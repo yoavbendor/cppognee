@@ -29,6 +29,10 @@ The stream is the scan.py protocol (scan_start, doc, section, passage, end per a
 uri is the revision it was read from, https://en.wikipedia.org/w/index.php?oldid=N, and its sha256 is that of the
 wikitext (see docmem.sources.read_span for how passages are read back). Progress and the seeded pool sizes go to
 stderr.
+
+--extractor (default wikiplain/1) chooses how the wikitext becomes markdown (docmem.extract): wikiplain/2 also
+renders value templates ({{convert}}, {{nowrap}}, {{start date}}, ...) as their text. The doc's "extractor" says
+which one it was.
 """
 
 import argparse
@@ -51,8 +55,10 @@ from pathlib import Path
 
 import mwparserfromhell
 
+from functools import partial
+
 from . import PROTOCOL
-from .extract.wikiplain import EXTRACTOR, to_markdown_with_links
+from .extract import RENDERERS
 from .links import wiki_target
 from .scan import scan_bytes
 from .sources import USER_AGENT, fetch
@@ -64,6 +70,7 @@ WIKI = "https://en.wikipedia.org/"
 MAX_CONCURRENT = 4
 JUDGE_BATCH = 64  # candidate pages whose word counts are checked together, in worker processes
 MIN_WORDS = 300  # a seeded article has at least this many words of extracted text
+DEFAULT_EXTRACTOR = "wikiplain/1"  # docmem.extract: wikiplain/2 also renders value templates (convert, dates, ...)
 REDIRECT = re.compile(r"\s*#REDIRECT\s*:?\s*\[\[([^\[\]\n]+)\]\]", re.IGNORECASE)
 TEMPLATE = re.compile(r"\{\{\s*([^|{}\n]+?)\s*[|}]")
 DISAMBIGUATION_TEMPLATES = frozenset({
@@ -252,7 +259,8 @@ def sample(index: Index, n: int, seed: int, size: int):
                     return
 
 
-def emit(out, rec: dict, target_words: int, max_words: int, field: str | None = None) -> str:
+def emit(out, rec: dict, target_words: int, max_words: int, field: str | None = None,
+         extractor: str = DEFAULT_EXTRACTOR) -> str:
     text = rec["text"]
     data = text.encode("utf-8")
     revid, title = rec["revid"], rec["title"]
@@ -263,14 +271,14 @@ def emit(out, rec: dict, target_words: int, max_words: int, field: str | None = 
         "mtime": rec["mtime"],
         "title": title,
         "format": "wikitext",
-        "extractor": EXTRACTOR,
+        "extractor": extractor,
         "page_id": rec["page_id"],
         "revid": revid,
         "url": "https://en.wikipedia.org/wiki/" + title.replace(" ", "_"),
     }
     if field is not None:
         doc["field"] = field
-    md, links = to_markdown_with_links(title, text)
+    md, links = RENDERERS[extractor](title, text)
     for r in scan_bytes(md.encode("utf-8"), doc, title, target_words, max_words, links=links):
         out.write(json.dumps(r, ensure_ascii=False) + "\n")
     return doc["uri"]
@@ -321,10 +329,10 @@ def is_disambiguation(title: str, wikitext: str) -> bool:
     return False
 
 
-def article_problem(rec: dict) -> str | None:
+def article_problem(rec: dict, extractor: str = DEFAULT_EXTRACTOR) -> str | None:
     """Why a page record (page_of) is not a candidate article, or None when it is one: namespace 0, not a
     redirect, neither a disambiguation nor a list / outline / glossary / index page, and at least MIN_WORDS
-    words of extracted text."""
+    words of extracted text (by the given extractor)."""
     if rec["ns"] != "0":
         return "not an article"
     if rec["redirect"]:
@@ -333,7 +341,7 @@ def article_problem(rec: dict) -> str | None:
         return "list"
     if is_disambiguation(rec["title"], rec["text"]):
         return "disambiguation"
-    md, _ = to_markdown_with_links(rec["title"], rec["text"])
+    md, _ = RENDERERS[extractor](rec["title"], rec["text"])
     if len(md.split()) < MIN_WORDS:
         return "short"
     return None
@@ -423,7 +431,8 @@ def seed_targets(source: DumpSource, seeds: list[tuple[str, str]]) -> dict[str, 
     return targets
 
 
-def candidate_articles(source: DumpSource, targets: dict[str, set[str]]):
+def candidate_articles(source: DumpSource, targets: dict[str, set[str]],
+                       extractor: str = DEFAULT_EXTRACTOR):
     """The candidate articles the seeds link to, by page id: {pid: {"title", "stream", "fields"}}, with the
     fields each one is linked from; and a count of what was left out, by reason. A redirect among the targets is
     followed once; its target takes the fields of the redirect. The word counts (article_problem) run in worker
@@ -441,7 +450,8 @@ def candidate_articles(source: DumpSource, targets: dict[str, set[str]]):
         def flush() -> None:
             if not pending:
                 return
-            for (pid, _), why in zip(pending, procs.map(article_problem, [rec for _, rec in pending])):
+            judge_with = partial(article_problem, extractor=extractor)
+            for (pid, _), why in zip(pending, procs.map(judge_with, [rec for _, rec in pending])):
                 if why:
                     report[why] += 1
                     judged[pid] = None
@@ -503,7 +513,7 @@ def candidate_articles(source: DumpSource, targets: dict[str, set[str]]):
 
 
 def titles_selection(source: DumpSource, titles: list[tuple[str, str]], out, target_words: int,
-                     max_words: int) -> list[str]:
+                     max_words: int, extractor: str = DEFAULT_EXTRACTOR) -> list[str]:
     """Write the listed articles to out, in the order of titles; returns the revision URIs written."""
     located = source.locate({t for t, _ in titles})
     for t, _ in titles:
@@ -519,16 +529,16 @@ def titles_selection(source: DumpSource, titles: list[tuple[str, str]], out, tar
         if art is None:
             log(f"not an article (a redirect, another namespace or empty): {title!r}")
             continue
-        uris.append(emit(out, art, target_words, max_words, field=field or None))
+        uris.append(emit(out, art, target_words, max_words, field=field or None, extractor=extractor))
     return uris
 
 
 def seeded_selection(source: DumpSource, seeds, n: int, rng: random.Random, out, target_words: int,
-                     max_words: int) -> list[str]:
+                     max_words: int, extractor: str = DEFAULT_EXTRACTOR) -> list[str]:
     """Write the stratified sample of the seeds' articles to out; returns the revision URIs written."""
     fields = list(dict.fromkeys(f for _, f in seeds))
     targets = seed_targets(source, seeds)
-    cands, report = candidate_articles(source, targets)
+    cands, report = candidate_articles(source, targets, extractor)
     log(f"distinct candidate articles: {len(cands)}; left out: {dict(report)}")
     pools = {f: sorted(pid for pid, c in cands.items() if f in c["fields"]) for f in fields}
     for f in fields:
@@ -546,7 +556,7 @@ def seeded_selection(source: DumpSource, seeds, n: int, rng: random.Random, out,
         art = article_of(rec)
         if art is None:
             raise RuntimeError(f"article {pid} was a candidate but is not an article on the second read")
-        uris.append(emit(out, art, target_words, max_words, field=field_of[pid]))
+        uris.append(emit(out, art, target_words, max_words, field=field_of[pid], extractor=extractor))
 
     source.read(wanted, write)
     return uris
@@ -569,6 +579,10 @@ def main(argv=None):
     ap.add_argument("--titles", type=Path, default=None,
                     help="article titles, one per line, optionally 'title|field': read exactly these, in file "
                          "order, instead of drawing at random")
+    ap.add_argument("--extractor", choices=sorted(RENDERERS), default=DEFAULT_EXTRACTOR,
+                    help="wikitext to markdown: wikiplain/2 renders value templates (convert, val, nowrap, frac, "
+                         "circa, lang, abbr, math, start/end date, dts, birth/death date) as their text; "
+                         "wikiplain/1 drops them (docmem.extract)")
     ap.add_argument(
         "--target-words", type=int, default=180, help="merge blocks up to this many words"
     )
@@ -588,17 +602,17 @@ def main(argv=None):
     if a.titles is not None:
         stats = {"streams": 0, "bytes": 0, "draws": 0}
         source = DumpSource(index, path, size, stats)
-        uris = titles_selection(source, read_seeds(a.titles), out, a.target_words, a.max_words)
+        uris = titles_selection(source, read_seeds(a.titles), out, a.target_words, a.max_words, a.extractor)
     elif a.seed_pages is not None:
         stats = {"streams": 0, "bytes": 0, "draws": 0}
         source = DumpSource(index, path, size, stats)
         seeds = read_seeds(a.seed_pages)
         uris = seeded_selection(source, seeds, a.sample, random.Random(a.seed), out, a.target_words,
-                                a.max_words)
+                                a.max_words, a.extractor)
     else:
         uris, stats = [], {"streams": 0, "bytes": 0, "draws": 0}
         for i, (rec, stats) in enumerate(sample(index, a.sample, a.seed, size), 1):
-            uris.append(emit(out, rec, a.target_words, a.max_words))
+            uris.append(emit(out, rec, a.target_words, a.max_words, extractor=a.extractor))
             if i % 100 == 0:
                 log(
                     f"{i}/{a.sample} articles, {stats['draws']} draws, {stats['streams']} streams, "

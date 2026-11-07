@@ -110,8 +110,9 @@ def _mark(code, infos: list) -> None:
         code.insert_after(link, END)
 
 
-def _plain(wikitext: str, infos: list) -> str:
-    """Plain text of a fragment, with the marks of its article links."""
+def _plain(wikitext: str, infos: list, prepare=None) -> str:
+    """Plain text of a fragment, with the marks of its article links. prepare(code), when given, changes the parsed
+    fragment before anything is dropped (wikiplain/2 renders value templates there)."""
     wikitext = wikitext.replace("\r", "")
     while True:
         cut = TABLE.sub("", wikitext)
@@ -119,6 +120,8 @@ def _plain(wikitext: str, infos: list) -> str:
             break
         wikitext = cut
     code = mwparserfromhell.parse(wikitext)
+    if prepare is not None:
+        prepare(code)
     for link in code.filter_wikilinks(recursive=False):
         if str(link.title).strip().lower().startswith(DROP_LINK_PREFIXES):
             _remove(code, link)
@@ -156,7 +159,7 @@ def _categories(wikitext: str) -> list[str]:
     return names
 
 
-def _render(title: str, wikitext: str, infos: list) -> str:
+def _render(title: str, wikitext: str, infos: list, prepare=None) -> str:
     """The article as markdown, marks included."""
     blocks, skip_level = [], None
     for level, heading, body in _sections(wikitext):
@@ -165,13 +168,13 @@ def _render(title: str, wikitext: str, infos: list) -> str:
                 continue
             skip_level = None
         if heading is not None:
-            name = _mstrip(_plain(heading, infos), _is_space)
+            name = _mstrip(_plain(heading, infos, prepare), _is_space)
             if _clean(name).lower() in SKIP_SECTIONS:
                 skip_level = level
                 continue
             if _clean(name):
                 blocks.append("#" * level + " " + name)
-        for line in _plain(body, infos).split("\n"):
+        for line in _plain(body, infos, prepare).split("\n"):
             if _clean(line).strip():
                 blocks.append(_mstrip(line, _is_space))
     out = (
@@ -212,10 +215,16 @@ def _extract(marked: str):
 def to_markdown_with_links(title: str, wikitext: str):
     """(markdown, links): to_markdown(title, wikitext) and its links, as dicts without "type" or "uri"
     (docmem.links): "wiki" links with offset and length in UTF-8 bytes of the markdown, then "category" links."""
+    return markdown_with_links(title, wikitext, None)
+
+
+def markdown_with_links(title: str, wikitext: str, prepare):
+    """to_markdown_with_links, with prepare(code) applied to each parsed fragment (see _plain). The extractors
+    share this one renderer; prepare=None is wikiplain/1."""
     if MARK_RE.search(wikitext):
         raise ValueError(f"{title!r}: the wikitext contains characters docmem uses for link marks")
     infos: list = []
-    md, spans = _extract(_render(title, wikitext, infos))
+    md, spans = _extract(_render(title, wikitext, infos, prepare))
     md_bytes = md.encode("utf-8")
     links = []
     for k, a, b in spans:

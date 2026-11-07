@@ -1,8 +1,9 @@
 """Reading a passage back from its source: a file:// URI (docmem.store) or a Wikipedia revision.
 
 A Wikipedia document's URI is https://en.wikipedia.org/w/index.php?oldid=N. Its passages are byte ranges of
-the markdown that docmem.scan_wiki cuts from the revision's wikitext (extractor "wikiplain/1"); the wikitext is
-fetched with action=raw, checked against the document's SHA-256, extracted again, and the range is sliced out.
+the markdown that docmem.scan_wiki cuts from the revision's wikitext (extractor "wikiplain/1" or "wikiplain/2",
+see docmem.extract); the wikitext is fetched with action=raw, checked against the document's SHA-256, extracted
+again with the document's extractor, and the range is sliced out.
 Fetched texts are kept in memory only (a small lru_cache), never on disk.
 
 read_span returns (text, status) like docmem.store.read_span: "ok", "changed" (the source no longer matches the
@@ -20,7 +21,7 @@ import urllib.request
 from functools import lru_cache
 
 from . import store
-from .extract.wikiplain import EXTRACTOR, to_markdown
+from .extract import RENDERERS
 
 USER_AGENT = "docmem/0.1 (research prototype)"
 WIKI_OLDID = re.compile(r"^https://en\.wikipedia\.org/w/index\.php\?oldid=(\d+)$")
@@ -51,7 +52,7 @@ def fetch(url: str, headers: dict | None = None) -> bytes | None:
 
 
 @lru_cache(maxsize=128)
-def _markdown(oldid: int, title: str, doc_sha256: str | None):
+def _markdown(oldid: int, title: str, doc_sha256: str | None, extractor: str):
     """(markdown bytes or None, status) for one revision: action=raw is byte-identical to the dump's text
     (checked on sampled articles), so a hash mismatch means the revision changed, not a format difference."""
     raw = fetch(f"https://en.wikipedia.org/w/index.php?oldid={oldid}&action=raw")
@@ -59,7 +60,8 @@ def _markdown(oldid: int, title: str, doc_sha256: str | None):
         return None, "missing"
     if doc_sha256 is not None and hashlib.sha256(raw).hexdigest() != doc_sha256:
         return None, "changed"
-    return to_markdown(title, raw.decode("utf-8")).encode("utf-8"), "ok"
+    md, _ = RENDERERS[extractor](title, raw.decode("utf-8"))
+    return md.encode("utf-8"), "ok"
 
 
 def read_span(
@@ -76,13 +78,13 @@ def read_span(
     m = WIKI_OLDID.match(uri)
     if not m:
         raise ValueError(f"no reader for {uri}")
-    if extractor != EXTRACTOR:
+    if extractor not in RENDERERS:
         raise ValueError(
-            f"{uri}: extractor {extractor!r} is not one docmem reads (only {EXTRACTOR!r})"
+            f"{uri}: extractor {extractor!r} is not one docmem reads (only {sorted(RENDERERS)})"
         )
     if title is None:
         raise ValueError(f"{uri}: a wikiplain passage needs the document's title")
-    md, status = _markdown(int(m.group(1)), title, doc_sha256)
+    md, status = _markdown(int(m.group(1)), title, doc_sha256, extractor)
     if status != "ok":
         return "", status
     data = md[offset : offset + length]

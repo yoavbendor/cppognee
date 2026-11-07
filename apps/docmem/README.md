@@ -178,6 +178,16 @@ added, maintenance categories are dropped and cycles are broken (the closing edg
 `docmem ontology load --skos FILE.ttl --scheme NAME`. `FILE.doc_categories.json` (next to the Turtle file) maps each
 indexed title to its kept categories, for evaluation. Nothing calls an LLM; category texts are not written to disk.
 
+### Value templates (`--extractor wikiplain/2`)
+
+`wikiplain/1` drops every template, so values written as templates vanish ("throttle between  and  of the  thrust").
+`docmem scan-wiki --extractor wikiplain/2` renders the value-bearing ones as their text, as written in the source
+(`convert`/`cvt` as "65%" or "10500 lbf", ranges "1000 to 10000 lbf"; `val`, `nowrap`, `nobr`, `frac`, `sfrac`,
+`circa`, `lang`, `transl`, `abbr`, `mvar`, `math`, `start date`, `end date`, `dts`, `birth date`, `death date` as
+"1969-07-16"). The allow-list and each rule are in `docmem/extract/wikivalues.py`; any other template is stripped
+as before, and links inside a rendered template keep their records. `wikiplain/1` stays the default, so existing
+indexes are unchanged; a document's `extractor` says which one made its passages.
+
 ## SysML v2 models (`scan-sysml`)
 
 `docmem scan-sysml` reads a SysML v2 textual model (a `.sysml` file or a directory of them) and writes the same
@@ -306,3 +316,24 @@ docmem model-gaps  --db $MODEL --check UnverifiedRequirements --under TechnicalR
 
 Cognee's own retrievers (`CHUNKS`, `RAG_COMPLETION`, …) expect stored chunk text. So `ask` does its own retrieval over
 cognee's stores: a vector search, then the graph nodes, then a read of the file.
+
+## Alignment with a model DB
+
+`docmem align` links model elements (SysML sections) to prose documents, with no LLM, into a separate directory:
+
+```sh
+docmem align --kb KBDB --model MODELDB --model-name apollo11 --out ALIGNDIR
+docmem ask --db KBDB --with-model ALIGNDIR --model-db MODELDB "question"   # prose questions, plus model items
+docmem ask --db MODELDB --with-prose ALIGNDIR --prose-db KBDB "question"   # model questions, plus prose items
+```
+
+- **Direct:** each element is scored against each document (name, keyword, vector); the top documents above the threshold are kept.
+- **Propagation** (`--no-propagate` turns it off): an element with no direct row inherits the documents of its model
+  relations: a requirement takes its satisfier's (`satisfied by`), a usage or specialization takes its definition's
+  (`typed by`, `specializes`), a requirement definition takes its usages' (`usage of`), and an element takes its owner's
+  (`owned by`). Each link multiplies the score by 0.8, at most two links, three documents per element. A row records
+  its `basis` (`direct` or `propagated`), the `origin` element and the `path` of relations it came along.
+- **Query search:** with `--with-model` / `--with-prose`, the question is also searched in the other DB (model elements
+  by their centroid, prose passages by their vectors); `--aligned N` items each. Items are marked `found_by`:
+  `alignment` (stored rows), `query`, or `alignment+query`. `--no-query-align` keeps only the stored alignment.
+- **Coverage:** `meta.json` and the `align` output count elements aligned directly and with propagation, per kind.
