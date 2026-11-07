@@ -264,6 +264,29 @@ docmem model-show --db $MODEL "Apollo11::LunarModule"
   the library roots, the owned features, and the inherited features (from every type, transitively, each name once,
   from the most specific type, with redefinitions applied).
 
+### Export to nomograph-sysml and sysmldiag
+
+The resolved model can be read by nomograph-sysml and by sysledge's sysmldiag, in nomograph's index format.
+
+```sh
+docmem model-export --db $MODEL --model apollo11 --out apollo_index.json      # add --include-library for all of it
+nomograph-sysml stat --index apollo_index.json
+PYTHONPATH=tools python3 -m sysmldiag --index apollo_index.json --out reports/diagrams --views all --format mermaid
+docmem model-check --db $MODEL --model apollo11                               # nomograph's checks, stored as findings
+docmem model-gaps  --db $MODEL --check UnverifiedRequirements --under TechnicalRequirementsPackage
+```
+
+- **Targets** are the resolved qualified names (`r_typed_by`, `r_specializes`, `r_subsets` as `Specialize`,
+  `r_redefines`, `r_satisfy`, `r_perform`, `r_allocate`). Member comes from each element's owner, and an element's
+  `doc` from its own doc comment, read back from the file.
+- **Library elements** are exported where a model element refers to them, with their owners. `--include-library`
+  exports all of them. A SysML keyword not in `KEYWORD_KIND` is exported as `generic_usage` and listed in the report.
+- **Not exported:** imports, `bind`, `connect`, `exhibit` and transitions (the DB keeps none of them as resolved edges),
+  and the `#refinement` statements that nomograph lists as elements. A relationship's span is its whole line, since the
+  DB keeps lines but no columns.
+- **Model checks** run nomograph's `check all --detail` on the export. Each finding is a `ModelFinding` node with an
+  `about` edge to its element's section. A re-run replaces them. `model-gaps` lists them.
+
 ## What changed in cognee (this fork)
 
 1. **`DataPoint.metadata["store_index_text"] = False`** (LanceDB adapter): the index field is embedded, and the vector
