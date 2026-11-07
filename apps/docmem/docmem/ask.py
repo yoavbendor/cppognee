@@ -1,0 +1,883 @@
+"""Ask: embed the question with the index's model, find the nearest passages in cognee's vector table,
+read their byte ranges back from the files (checking each range's SHA-256), and have the chat model
+answer from them, citing file and line.
+
+    docmem ask --db ./kb --api-base https://host/v1 --model gpt-4.1-mini "what does X do?"
+    docmem ask --db ./kb --no-answer "..."      # retrieval only: no API needed
+"""
+import argparse
+import asyncio
+import json
+import math
+import os
+import sys
+import time
+from pathlib import Path
+
+from . import store
+from .decide import DeciderError, DeciderResponseError
+
+ANSWER_SYSTEM = (
+    "You answer questions using only the numbered excerpts from the user's documents. "
+    "Cite the excerpts you use as [1], [2]. Be concise: a sentence or a short paragraph. "
+    "If the excerpts do not contain the answer, reply with 'NOT FOUND:' and one sentence on what they "
+    "do cover. Do not use outside knowledge.")
+
+# --hops: the same answer prompt, plus a SEARCH option for a fact the excerpts lack.
+ANSWER_SYSTEM_HOPS = (
+    "You answer questions using only the numbered excerpts from the user's documents. "
+    "Cite the excerpts you use as [1], [2]. Be concise: a sentence or a short paragraph. "
+    "If a fact the question needs is missing from the excerpts (another subject, a place, a date, or the "
+    "thing a found fact points to), reply ONLY with 1 or 2 lines, each 'SEARCH: <short search query for "
+    "that fact>', and nothing else. Otherwise answer. Reply 'NOT FOUND:' and one sentence only if the "
+    "excerpts clearly do not cover it. Do not use outside knowledge.")
+
+RERANK_SYSTEM = (
+    "You rank document excerpts by how well they answer a question. Reply with JSON only: "
+    '{"scores": [s1, s2, ...]}, one integer per excerpt in order, 0 = irrelevant, 1 = related, '
+    "2 = partly answers, 3 = answers it.")
+
+
+async def retrieve(question: str, k: int, candidates: int | None = None):
+    """The nearest passages: [{rank, distance, uri, path, offset, length, line, end_line, sha256, ...}]."""
+    graph, vector = await store.engines()
+    t = time.time()
+    results = await vector.search(store.PASSAGES, query_text=question, limit=candidates or k)
+    t_vec = time.time() - t
+    ids = [str(r.id) for r in results]
+    nodes = {n["id"]: store.node_props(n) for n in await graph.get_nodes(ids)}
+    hits = []
+    for r in results:
+        n = nodes.get(str(r.id))
+        if n is None:
+            continue  # a vector without its graph node: the indexer was interrupted mid-write
+        hits.append({"distance": round(float(r.score), 4), **{k_: n[k_] for k_ in (
+            "id", "name", "path", "offset", "length", "line", "end_line", "sha256", "section_offset",
+            "section_length")}, "extractor": n.get("extractor", ""), "doc_sha256": n.get("doc_sha256", "")})
+    for i, h in enumerate(hits, 1):
+        h["rank"] = i
+        h["uri"] = h.pop("name")
+    return hits, {"vector_ms": round(t_vec * 1000, 1), "total_ms": round((time.time() - t) * 1000, 1)}
+
+
+def span(h, offset, length, sha256=None):
+    from . import sources
+
+    return sources.read_span(h["uri"], offset, length, sha256, extractor=h["extractor"] or None,
+                             doc_sha256=h["doc_sha256"] or None, title=h["path"].split(" › ")[0])
+
+
+OWN_SUFFIX = " (its article)"  # a target's name when it is the document the passage belongs to
+LEAD_BONUS = 1.5  # --link-weights det: a linking passage in its document's lead section
+OWN_BONUS = 1.5   # --link-weights det: a passage of the target's own article
+DECIDE_QUESTION = "Which linked topic would most help answer the question, given this passage?"
+DECIDE_MAX_TARGETS = 40  # --link-weights decide: a passage with more targets is asked about the 40 highest-idf
+NONE_OPTION = "none"     # --link-weights decide: the option for "no link helps"
+
+
+async def link_neighbours(graph, passage_ids: list[str]):
+    """Passages one link away from the given ones, with no LLM: through every target they link to
+    (wiki title, URL, file, ID), the other passages linking to that target and the passages of the
+    document that is the target. Returns {passage id: [target name, ...]}, {target name: in-degree}
+    (passages linking to it) and {target name: support} (distinct given passages linking to it)."""
+    if not passage_ids:
+        return {}, {}, {}
+    rows = await graph.query(
+        "MATCH (p:Node)-[r:EDGE]->(t:Node) WHERE p.id IN $ids AND r.relationship_name = 'links_to' "
+        "RETURN p.id, t.id, t.name", {"ids": passage_ids})
+    targets = {tid: name for _, tid, name in rows}
+    if not targets:
+        return {}, {}, {}
+    support = {}
+    for pid, _, name in rows:
+        support.setdefault(name, set()).add(pid)
+    tids = list(targets)
+    via, degree = {}, {}
+    # other passages linking to the same targets
+    for pid, tid in await graph.query(
+            "MATCH (q:Node)-[r:EDGE]->(t:Node) WHERE t.id IN $tids AND r.relationship_name = 'links_to' "
+            "AND q.type = 'DocPassage' RETURN q.id, t.id", {"tids": tids}):
+        degree[targets[tid]] = degree.get(targets[tid], 0) + 1
+        via.setdefault(pid, []).append(targets[tid])
+    # passages of documents that are the targets
+    for pid, tid in await graph.query(
+            "MATCH (f:Node)-[r:EDGE]->(t:Node) WHERE t.id IN $tids AND r.relationship_name = 'is_target' "
+            "MATCH (p:Node)-[r1:EDGE]->(s:Node)-[r2:EDGE]->(f) WHERE r1.relationship_name = 'section' "
+            "AND r2.relationship_name = 'doc' RETURN p.id, t.id", {"tids": tids}):
+        via.setdefault(pid, []).append(targets[tid] + " (its article)")
+    for pid in passage_ids:
+        via.pop(pid, None)
+    return via, degree, {name: len(pids) for name, pids in support.items()}
+
+
+async def hits_for(ids, distance: dict):
+    """Hit dicts (as retrieve makes them) for passage ids, in the given order."""
+    graph, _ = await store.engines()
+    nodes = {nd["id"]: store.node_props(nd) for nd in await graph.get_nodes(list(ids))}
+    out = []
+    for pid in ids:
+        nd = nodes.get(pid)
+        if nd is None:
+            continue
+        out.append({"distance": distance.get(pid), **{k_: nd[k_] for k_ in (
+            "id", "path", "offset", "length", "line", "end_line", "sha256", "section_offset", "section_length")},
+            "extractor": nd.get("extractor", ""), "doc_sha256": nd.get("doc_sha256", ""), "uri": nd["name"]})
+    return out
+
+
+async def distances(question: str, cands) -> dict[str, float]:
+    """Cosine distance from the question to each candidate passage's stored vector (no re-embedding)."""
+    import numpy as np
+
+    _, vector = await store.engines()
+    rows = await vector.retrieve(store.PASSAGES, list(cands), include_vector=True)
+    q = np.asarray((await vector.embedding_engine.embed_text([question]))[0], dtype=np.float32)
+    q /= np.linalg.norm(q) or 1
+    return {str(r.id): 1 - float(q @ (v := np.asarray(r.payload["vector"], dtype=np.float32)) /
+                                 (np.linalg.norm(v) or 1)) for r in rows}
+
+
+async def best_of(question: str, cands, n: int):
+    """The n candidate passages nearest the question, by their stored vectors (no re-embedding)."""
+    scored = sorted((d, pid) for pid, d in (await distances(question, cands)).items())[:n]
+    return await hits_for([pid for _, pid in scored], {pid: round(d, 4) for d, pid in scored})
+
+
+async def hybrid(question: str, k: int, db):
+    """Vector and keyword (BM25) results fused by reciprocal rank (1 / (60 + rank) summed), top k."""
+    from .keywords import KeywordIndex
+
+    vec, timing = await retrieve(question, 3 * k)
+    t = time.time()
+    kw = KeywordIndex(db).search(question, 3 * k)
+    timing["keyword_ms"] = round((time.time() - t) * 1000, 1)
+    score = {}
+    for i, h in enumerate(vec, 1):
+        score[h["id"]] = score.get(h["id"], 0) + 1 / (60 + i)
+    for i, (pid, _) in enumerate(kw, 1):
+        score[pid] = score.get(pid, 0) + 1 / (60 + i)
+    top = sorted(score, key=lambda p: -score[p])[:k]
+    by_id = {h["id"]: h for h in vec}
+    missing = [p for p in top if p not in by_id]
+    by_id.update({h["id"]: h for h in await hits_for(missing, {})})
+    out = [by_id[p] for p in top if p in by_id]
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, timing
+
+
+async def expand_terms(question: str, hits, n: int, db, terms: int = 8):
+    """Add up to n passages of OTHER documents that share rare terms with the hits (bridge terms: in the
+    hits and elsewhere, in few passages), found by BM25 over those terms and ranked by the question's
+    similarity to their stored vectors; no LLM."""
+    from .keywords import KeywordIndex
+
+    kw = KeywordIndex(db)
+    rare = [t for t, _ in kw.bridge_terms([h["id"] for h in hits], terms)]
+    if not rare:
+        return hits, []
+    docs = {h["uri"] for h in hits}
+    found = kw.search(" ".join(rare), 10 * n)
+    cands = {pid: rare for pid, _ in found if pid not in {h["id"] for h in hits}}
+    added = [h for h in await best_of(question, cands, 3 * n) if h["uri"] not in docs][:n]
+    for h in added:
+        h["via"] = ["terms: " + ", ".join(rare[:4])]
+    out = hits + added
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, [h["via"] for h in added]
+
+
+def weigh_links(cands: dict[str, list[str]], sims: dict[str, float], idf: dict[str, float],
+                support: dict[str, int], lead: dict[str, bool], lam: float) -> dict[str, dict]:
+    """--link-weights det: each candidate's link score (the sum over the targets reaching it of idf x support x
+    lead, the own-article bonus for a target's own article), normalized by the best candidate's, and its final
+    rank lam x normalized link score + (1 - lam) x similarity. cands: {passage: [target name]} (not common)."""
+    records = {}
+    for pid, ts in cands.items():
+        lead_f = LEAD_BONUS if lead[pid] else 1.0
+        comps = []
+        for t in ts:
+            own = t.endswith(OWN_SUFFIX)
+            base = t[:-len(OWN_SUFFIX)] if own else t
+            w = idf[base] * support[base] * lead_f * (OWN_BONUS if own else 1.0)
+            comps.append({"target": t, "idf": round(idf[base], 4), "support": support[base], "lead": lead_f,
+                          "own": own, "contribution": round(w, 4), "_w": w})
+        records[pid] = {"link_score": sum(c["_w"] for c in comps), "targets": comps}
+    best = max((r["link_score"] for r in records.values()), default=0.0)
+    for pid, r in records.items():
+        for c in r["targets"]:
+            del c["_w"]
+        norm = r["link_score"] / best if best > 0 else 0.0
+        r.update({"link_score": round(r["link_score"], 4), "norm_link": round(norm, 4),
+                  "similarity": round(sims[pid], 4), "lead": lead[pid],
+                  "final": round(lam * norm + (1 - lam) * sims[pid], 4)})
+    return records
+
+
+async def det_links(question: str, cands: dict[str, list[str]], degree: dict[str, int], support: dict[str, int],
+                    n: int, lam: float):
+    """The n candidates with the best final rank (weigh_links), each with its weight components."""
+    graph, _ = await store.engines()
+    dist = await distances(question, cands)
+    cands = {pid: ts for pid, ts in cands.items() if pid in dist}
+    if not cands:
+        return []
+    nodes = {nd["id"]: store.node_props(nd) for nd in await graph.get_nodes(list(cands))}
+    lead = {pid: " › " not in nodes[pid]["path"] for pid in cands}
+    bases = {t[:-len(OWN_SUFFIX)] if t.endswith(OWN_SUFFIX) else t for ts in cands.values() for t in ts}
+    idf = await link_idf(graph, bases, degree)
+    records = weigh_links(cands, {pid: 1 - dist[pid] for pid in cands}, idf, support, lead, lam)
+    top = sorted(records, key=lambda pid: (-records[pid]["final"], pid))[:n]
+    added = await hits_for(top, {pid: round(dist[pid], 4) for pid in top})
+    for h in added:
+        h["weights"] = records[h["id"]]
+        h["via"] = cands[h["id"]]
+    return added
+
+
+async def link_idf(graph, names, degree: dict[str, int]) -> dict[str, float]:
+    """idf of each target name: log(DocPassages / (1 + passages linking to the target))."""
+    total = (await graph.query("MATCH (p:Node) WHERE p.type = 'DocPassage' RETURN count(p)", {}))[0][0]
+    return {n: math.log(total / (1 + degree[n])) for n in names}
+
+
+async def outgoing_links(graph, passage_ids: list[str]) -> dict[str, dict[str, str]]:
+    """{passage id: {target name: anchor text}} for the links_to edges out of the given passages. The anchor is the
+    edge's "anchor" property, or the target's name when the link has none."""
+    rows = await graph.query(
+        "MATCH (p:Node)-[r:EDGE]->(t:Node) WHERE p.id IN $ids AND r.relationship_name = 'links_to' "
+        "RETURN p.id, t.name, r.properties", {"ids": passage_ids})
+    out: dict[str, dict[str, str]] = {}
+    for pid, name, props in rows:
+        if isinstance(props, str):
+            props = json.loads(props)
+        out.setdefault(pid, {}).setdefault(name, (props or {}).get("anchor") or name)
+    return out
+
+
+def link_criteria(targets: dict[str, str]) -> dict[str, str]:
+    """The choice options of one passage: each target named, described as the anchor it is linked as, and a
+    "none" option (renamed only if a target is itself called "none")."""
+    none = NONE_OPTION
+    while none in targets:
+        none = "_" + none
+    criteria = {t: f"linked as: {anchor}" for t, anchor in targets.items()}
+    criteria[none] = "none of these links helps answer the question"
+    return criteria
+
+
+def ask_links(question: str, passages: list[dict], decider, log_path: Path | None = None) -> dict[tuple[str, str], float]:
+    """--link-weights decide: for each passage ({id, path, text, targets: {name: anchor}}), ask the decision model
+    which of its linked topics would most help answer the question. Returns {(passage id, target name): p_target}.
+    Each decision is appended to log_path when given."""
+    probs = {}
+    for p in passages:
+        state = f"Question: {question}\n\nPassage ({p['path']}):\n{p['text']}"
+        q = {"type": "choice", "instructions": DECIDE_QUESTION, "criteria": link_criteria(p["targets"])}
+        d = decider.decide(state, {"link": q})["link"]
+        for t in p["targets"]:
+            probs[(p["id"], t)] = d.probabilities.get(t, 0.0)
+        if log_path:
+            rec = {"question": question, "passage": p["path"], "passage_id": p["id"], "choice": d.choice,
+                   "probabilities": d.probabilities, "options": link_criteria(p["targets"])}
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return probs
+
+
+def weigh_decided(cands: dict[str, list[str]], probs: dict[tuple[str, str], float], sims: dict[str, float],
+                  lam: float) -> dict[str, dict]:
+    """--link-weights decide: each candidate's link score, the sum over the (hit, target) pairs reaching it of the
+    decision model's p_target, normalized by the best candidate's, and its final rank lam x normalized link score +
+    (1 - lam) x similarity. cands: {passage: [target name, or name + OWN_SUFFIX for the target's own article]}."""
+    by_target: dict[str, list[tuple[str, float]]] = {}
+    for (hid, t), p in probs.items():
+        by_target.setdefault(t, []).append((hid, p))
+    records = {}
+    for pid, ts in cands.items():
+        reaching = []
+        for t in ts:
+            base = t[:-len(OWN_SUFFIX)] if t.endswith(OWN_SUFFIX) else t
+            for hid, p in by_target.get(base, []):
+                reaching.append({"target": t, "from": hid, "p_target": p})
+        records[pid] = {"score": sum(r["p_target"] for r in reaching), "targets": reaching}
+    best = max((r["score"] for r in records.values()), default=0.0)
+    for pid, r in records.items():
+        norm = r["score"] / best if best > 0 else 0.0
+        records[pid] = {"link_score": round(r["score"], 4), "norm_link": round(norm, 4),
+                        "similarity": round(sims[pid], 4), "final": round(lam * norm + (1 - lam) * sims[pid], 4),
+                        "targets": [{**r_, "p_target": round(r_["p_target"], 4)} for r_ in r["targets"]]}
+    return records
+
+
+async def decide_links(question: str, hits, cands: dict[str, list[str]], out_links: dict[str, dict[str, str]],
+                       degree: dict[str, int], n: int, lam: float, decider, max_bytes: int,
+                       log_path: Path | None):
+    """The n candidates with the best final rank under the decision model's link weights (weigh_decided). out_links:
+    each hit's targets after the max-degree cut-off. A passage with more than DECIDE_MAX_TARGETS targets is asked
+    about the ones with the highest idf only."""
+    graph, _ = await store.engines()
+    dist = await distances(question, cands)
+    cands = {pid: ts for pid, ts in cands.items() if pid in dist}
+    if not cands:
+        return []
+    idf = await link_idf(graph, {t for ts in out_links.values() for t in ts}, degree)
+    passages = []
+    for h in read_hits([h for h in hits if out_links.get(h["id"])], "passage", max_bytes):
+        targets = out_links[h["id"]]
+        if len(targets) > DECIDE_MAX_TARGETS:
+            kept = sorted(targets, key=lambda t: -idf[t])[:DECIDE_MAX_TARGETS]
+            print(f"docmem decide: {h['path']} links to {len(targets)} targets; asking about the "
+                  f"{DECIDE_MAX_TARGETS} with the highest idf", file=sys.stderr, flush=True)
+            targets = {t: targets[t] for t in kept}
+        passages.append({"id": h["id"], "path": h["path"], "text": h["text"], "targets": targets})
+    probs = ask_links(question, passages, decider, log_path)
+    records = weigh_decided(cands, probs, {pid: 1 - dist[pid] for pid in cands}, lam)
+    top = sorted(records, key=lambda pid: (-records[pid]["final"], pid))[:n]
+    added = await hits_for(top, {pid: round(dist[pid], 4) for pid in top})
+    for h in added:
+        h["weights"] = records[h["id"]]
+        h["via"] = cands[h["id"]]
+    return added
+
+
+async def expand_links(question: str, hits, n: int, max_degree: int, weights: str = "none", lam: float = 0.5,
+                       decider=None, max_bytes: int = 6000, decision_log: Path | None = None):
+    """Add up to n passages reached through links from the hits. Targets linked from more than max_degree
+    passages (e.g. a country) are too common to say anything and are not followed. Ranked by the question's
+    similarity to their stored vectors (weights none), by the deterministic link weights (weights det, see
+    weigh_links), or by the decision model's choice of linked topic for each hit (weights decide, see
+    decide_links). If the decision model is unreachable the question falls back to det, with a warning."""
+    graph, _ = await store.engines()
+    via, degree, support = await link_neighbours(graph, [h["id"] for h in hits])
+    common = {t for t, d in degree.items() if d > max_degree}
+    cands = {pid: [t for t in ts if t not in common] for pid, ts in via.items()}
+    cands = {pid: ts for pid, ts in cands.items() if ts}
+    if not cands:
+        return hits, []
+    added = None
+    if weights == "decide":
+        if decider is None:
+            raise ValueError("--link-weights decide needs a decider (DOCMEM_DECIDER_URL and DOCMEM_DECIDER_MODEL)")
+        out_links = {pid: {t: anchor for t, anchor in ts.items() if t not in common}
+                     for pid, ts in (await outgoing_links(graph, [h["id"] for h in hits])).items()}
+        try:
+            added = await decide_links(question, hits, cands, out_links, degree, n, lam, decider, max_bytes,
+                                       decision_log)
+        except DeciderResponseError:
+            raise  # the server answered, but not in the shape this client reads: a bug to see, not a fallback
+        except DeciderError as e:
+            print(f"docmem: --link-weights decide fell back to det for this question: {e}", file=sys.stderr,
+                  flush=True)
+            weights = "det"
+    if weights == "det":
+        added = await det_links(question, cands, degree, support, n, lam)
+    elif weights == "none":
+        added = await best_of(question, cands, n)
+        for h in added:
+            h["via"] = cands[h["id"]]
+    out = hits + added
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, [h["via"] for h in added]
+
+
+async def expand_concepts(question: str, hits, n: int, scheme: str | None = None):
+    """Add up to n passages of OTHER documents that share a concept with the hits' documents, ranked by the
+    question's similarity to their stored vectors; no LLM. Only concepts at CONCEPT_MIN_LEVEL or deeper are
+    followed, so a broad one like "sport" does not pull in every sports article."""
+    from . import ontology
+
+    graph, _ = await store.engines()
+    doc_of = await ontology.docs_of_passages(graph, [h["id"] for h in hits])
+    own = set(doc_of.values())
+    if not own:
+        return hits, []
+    shared = {}
+    for concepts in (await ontology.concepts_of_docs(graph, list(own), ontology.CONCEPT_MIN_LEVEL, scheme)).values():
+        shared.update(concepts)
+    if not shared:
+        return hits, []
+    via: dict[str, list[str]] = {}  # other document id -> its shared concepts' labels
+    for cid, fids in (await ontology.docs_with_concepts(graph, list(shared))).items():
+        for fid in fids:
+            if fid not in own:
+                via.setdefault(fid, []).append(shared[cid])
+    if not via:
+        return hits, []
+    cands: dict[str, list[str]] = {}
+    for fid, pids in (await ontology.passages_of_docs(graph, list(via))).items():
+        for pid in pids:
+            cands[pid] = [f"concept: {label}" for label in via[fid]]
+    added = await best_of(question, cands, n)
+    for h in added:
+        h["via"] = cands[h["id"]]
+    out = hits + added
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, [h["via"] for h in added]
+
+
+def best_per_document(ranked: list[dict], n: int) -> list[dict]:
+    """ranked is best first. Keep each document's best passage, then the n best documents' passages, in order."""
+    seen, firsts = set(), []
+    for h in ranked:
+        if h["uri"] not in seen:
+            seen.add(h["uri"])
+            firsts.append(h)
+    return firsts[:n]
+
+
+async def pivot_concepts(question: str, scheme: str | None, n: int) -> list[tuple[str, str]]:
+    """The concepts the question names, as (id, label): those whose label occurs in it (any level, longest
+    first), then the n nearest to the question's vector among concepts at level 1 or deeper. No LLM."""
+    from . import ontology
+
+    graph, vector = await store.engines()
+    nodes = await ontology.nodes_of_type(graph, "DocConcept")
+    if scheme is not None:
+        if scheme not in {x.get("scheme") for x in nodes}:
+            raise SystemExit(f"docmem ask --pivot-scheme: no scheme {scheme!r} in this index")
+        nodes = [x for x in nodes if x.get("scheme") == scheme]
+    if not nodes:
+        raise SystemExit("docmem ask --pivot: this index has no ontology (run docmem ontology load first)")
+    names = {x["id"]: x["name"] for x in nodes}
+    level = {x["id"]: x.get("level", 0) for x in nodes}
+    named = ontology.label_matches(question, names)
+    qv = (await vector.embedding_engine.embed_text([question]))[0]
+    found = sorted(await vector.search(ontology.CONCEPTS, query_text=None, query_vector=list(qv), limit=50),
+                   key=lambda r: float(r.score))
+    nearest = [str(r.id) for r in found if str(r.id) in names and level[str(r.id)] >= 1][:n]
+    return [(cid, names[cid]) for cid in named + [c for c in nearest if c not in named]]
+
+
+def question_parts(question: str) -> list[str]:
+    """The parts of a question naming several subjects ("A, B and C"): split at commas, "and", "or";
+    [] when that gives fewer than two parts."""
+    import re
+
+    parts = [p.strip(" ?.") for p in re.split(r",|\band\b|\bor\b", question) if p.strip(" ?.")]
+    return parts if len(parts) >= 2 else []
+
+
+async def expand_parts(question: str, hits, per_part: int):
+    """Retrieve for each named subject separately and add its best passages (no LLM)."""
+    have = {h["id"] for h in hits}
+    added = []
+    for part in question_parts(question):
+        found, _ = await retrieve(part, per_part)
+        for h in found:
+            if h["id"] not in have:
+                have.add(h["id"])
+                h["via"] = [f"part: {part}"]
+                added.append(h)
+    out = hits + added
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, [h["via"] for h in added]
+
+
+async def concept_passages(cids: list[str], labels: dict, db, per_concept: int = 30) -> dict[str, list[str]]:
+    """{concept id: passage ids} found by searching the passages WITH the concept: its own stored vector
+    (label + definition) as the query, and its label as a keyword (BM25) query when the index has one.
+    This reaches passages that discuss the concept although their document's top concepts are others."""
+    from pathlib import Path
+
+    _, vector = await store.engines()
+    out = {}
+    rows = await vector.retrieve("DocConcept_embed_text", cids, include_vector=True)
+    for r in rows:
+        found = await vector.search(store.PASSAGES, query_vector=r.payload["vector"], limit=per_concept)
+        out[str(r.id)] = [str(x.id) for x in found]
+    if (Path(db) / "system" / "databases" / "docmem_keywords.lancedb").exists():
+        from .keywords import KeywordIndex
+
+        kw = KeywordIndex(Path(db))
+        for cid in cids:
+            out.setdefault(cid, []).extend(pid for pid, _ in kw.search(labels[cid], per_concept))
+    return out
+
+
+async def expand_pivot(question: str, hits, n: int, scheme: str | None, concepts: int, db=None):
+    """Retrieve through a concept: passages of the documents (or their sections) about a concept the question
+    names, the best passage of each of up to n documents by the question's similarity to their stored vectors.
+    Returns (hits, linked, the chosen concepts as (id, label))."""
+    from . import ontology
+
+    graph, _ = await store.engines()
+    picks = await pivot_concepts(question, scheme, concepts)
+    labels = dict(picks)
+    cids = list(labels)
+    if not cids:
+        return hits, [], picks
+    have = {h["id"] for h in hits}
+    docs = await ontology.docs_with_concepts(graph, cids)
+    secs = await ontology.sections_with_concepts(graph, cids)
+    by_doc = await ontology.passages_of_docs(graph, sorted({f for fs in docs.values() for f in fs}))
+    by_sec = await ontology.passages_of_sections(graph, sorted({s for ss in secs.values() for s in ss}))
+    searched = await concept_passages(cids, labels, db) if db else {}
+    cands: dict[str, list[str]] = {}  # passage id -> the labels of the concepts that reach it
+    for cid in cids:
+        pids = [p for f in docs.get(cid, []) for p in by_doc.get(f, [])] + \
+               [p for s in secs.get(cid, []) for p in by_sec.get(s, [])] + searched.get(cid, [])
+        for pid in pids:
+            if pid not in have:
+                tags = cands.setdefault(pid, [])
+                if f"pivot: {labels[cid]}" not in tags:
+                    tags.append(f"pivot: {labels[cid]}")
+    if not cands:
+        return hits, [], picks
+    added = best_per_document(await best_of(question, cands, len(cands)), n)
+    for h in added:
+        h["via"] = cands[h["id"]]
+    out = hits + added
+    for i, h in enumerate(out, 1):
+        h["rank"] = i
+    return out, [h["via"] for h in added], picks
+
+
+async def link_notes(hits) -> list[str]:
+    """Sentences naming how the excerpts are linked, from the link graph (no LLM): excerpts of different
+    documents that link to the same target, and an excerpt linking to the document another one is from."""
+    graph, _ = await store.engines()
+    ids = [h["id"] for h in hits]
+    if not ids:
+        return []
+    rows = await graph.query(
+        "MATCH (p:Node)-[r:EDGE]->(t:Node) WHERE p.id IN $ids AND r.relationship_name = 'links_to' "
+        "RETURN p.id, t.id, t.name", {"ids": ids})
+    pos = {h["id"]: i for i, h in enumerate(hits, 1)}
+    doc_of = {i: h["uri"] for i, h in enumerate(hits, 1)}
+    by_target, names = {}, {}
+    for pid, tid, name in rows:
+        by_target.setdefault(tid, set()).add(pos[pid])
+        names[tid] = name
+    notes = []
+    for tid, ps in by_target.items():
+        if len({doc_of[i] for i in ps}) > 1:
+            ps = sorted(ps)
+            notes.append(f"{', '.join(f'[{i}]' for i in ps[:-1])} and [{ps[-1]}] all mention {names[tid]}."
+                         if len(ps) > 2 else f"[{ps[0]}] and [{ps[1]}] both mention {names[tid]}.")
+    # an excerpt linking to the subject of another excerpt's document
+    subj = await graph.query(
+        "MATCH (f:Node)-[r:EDGE]->(t:Node) WHERE t.id IN $tids AND r.relationship_name = 'is_target' "
+        "RETURN f.name, t.id", {"tids": list(by_target)}) if by_target else []
+    for furi, tid in subj:
+        for j, h in enumerate(hits, 1):
+            if h["uri"] == furi:
+                for i in sorted(by_target[tid]):
+                    if doc_of[i] != furi:
+                        notes.append(f"[{i}] mentions {names[tid]}, which is what [{j}] is about.")
+                break
+    return notes
+
+
+async def notes_for(hits, a):
+    """--link-notes: the notes for the excerpts the model will see (stale ones are not shown)."""
+    return await link_notes([h for h in hits if h["status"] == "ok"]) if a.link_notes else None
+
+
+def read_hits(hits, context: str, max_bytes: int):
+    """Attach each hit's text. context "section" reads the enclosing section instead of the passage
+    (once per section), cut at max_bytes."""
+    seen = set()
+    out = []
+    for h in hits:
+        if context == "section":
+            sec = (h["uri"], h["section_offset"])
+            if sec in seen:
+                continue
+            seen.add(sec)
+            text, status = span(h, h["section_offset"], min(h["section_length"], max_bytes))
+            # the section's bytes are not hashed; the passage's are, so check the passage
+            _, status = span(h, h["offset"], h["length"], h["sha256"])
+        else:
+            text, status = span(h, h["offset"], h["length"], h["sha256"])
+        out.append({**h, "text": text, "status": status})
+    return out
+
+
+def where(h) -> str:
+    """file.md:12-14 for a local file; the revision URL for a web source."""
+    if h["uri"].startswith("file:"):
+        return f"{store.uri_path(h['uri']).name}:{h['line']}-{h['end_line']}"
+    return h["uri"]
+
+
+def label(h) -> str:
+    """Where an excerpt is from: its file and lines and heading path; an aligned item names its kind first."""
+    kind = f"{h['aligned']}: " if h.get("aligned") else ""
+    return f"{kind}{where(h)} — {h['path']}"
+
+
+def excerpts(hits) -> str:
+    return "\n\n".join(f"[{i}] {label(h)}\n{h['text']}" for i, h in enumerate(hits, 1))
+
+
+def rerank(chat, question: str, hits, k: int):
+    scores = chat.complete_json(RERANK_SYSTEM, f"Question: {question}\n\nExcerpts:\n\n{excerpts(hits)}")
+    scores = scores["scores"] if isinstance(scores, dict) else scores
+    if len(scores) != len(hits):
+        raise ValueError(f"rerank: {len(scores)} scores for {len(hits)} excerpts")
+    order = sorted(range(len(hits)), key=lambda i: (-int(scores[i]), i))
+    return [{**hits[i], "rerank": int(scores[i])} for i in order[:k]]
+
+
+def answer(chat, question: str, hits, system: str = ANSWER_SYSTEM, notes=None) -> str:
+    usable = [h for h in hits if h["status"] == "ok"]
+    if not usable:
+        return "NOT FOUND: no passage could be read back from its file."
+    extra = ("\n\nHow the excerpts are linked:\n" + "\n".join(notes)) if notes else ""
+    return chat.complete(system, f"Excerpts:\n\n{excerpts(usable)}{extra}\n\nQuestion: {question}")
+
+
+def search_queries(reply: str) -> list[str]:
+    """The queries of a reply's SEARCH: lines; [] when the reply is an answer."""
+    out = []
+    for line in reply.splitlines():
+        s = line.strip()
+        if s[:7].upper() == "SEARCH:" and s[7:].strip():
+            out.append(s[7:].strip())
+    return out
+
+
+async def follow(queries: list[str], hits, a):
+    """Retrieve for each query, add the passages not already gathered (in order), cap the list at
+    --max-passages and renumber the ranks."""
+    have = {h["id"] for h in hits}
+    for q in queries:
+        new, _ = await retrieve(q, a.hop_k)
+        for h in read_hits(new, a.context, a.max_bytes):
+            if h["id"] not in have:
+                have.add(h["id"])
+                hits.append(h)
+    hits = hits[:a.max_passages]
+    for i, h in enumerate(hits, 1):
+        h["rank"] = i
+    return hits
+
+
+async def ask_one(question: str, a, chat):
+    before = chat.usage["calls"] if chat else 0
+    if a.keywords:
+        hits, timing = await hybrid(question, a.rerank or a.k, a.db)
+    else:
+        hits, timing = await retrieve(question, a.k, a.rerank or a.k)
+    linked = []
+    pivots = []
+    if a.split:
+        t = time.time()
+        hits, by_parts = await expand_parts(question, hits, a.split)
+        linked += by_parts
+        timing["split_ms"] = round((time.time() - t) * 1000, 1)
+    if a.pivot:
+        t = time.time()
+        hits, by_pivot, picks = await expand_pivot(question, hits, a.pivot, a.pivot_scheme, a.pivot_concepts, a.db)
+        linked += by_pivot
+        pivots = [label for _, label in picks]
+        timing["pivot_ms"] = round((time.time() - t) * 1000, 1)
+    if a.terms:
+        t = time.time()
+        hits, by_terms = await expand_terms(question, hits, a.terms, a.db)
+        linked += by_terms
+        timing["terms_ms"] = round((time.time() - t) * 1000, 1)
+    if a.concepts:
+        t = time.time()
+        hits, by_concepts = await expand_concepts(question, hits, a.concepts, a.concept_scheme)
+        linked += by_concepts
+        timing["concepts_ms"] = round((time.time() - t) * 1000, 1)
+    if a.links:
+        t = time.time()
+        before = dict(a.decider.stats) if a.decider else None
+        hits, by_links = await expand_links(question, hits, a.links, a.link_max_degree, a.link_weights,
+                                            a.link_lambda, a.decider, a.max_bytes, a.decision_log)
+        linked += by_links
+        timing["links_ms"] = round((time.time() - t) * 1000, 1)
+        if before is not None:
+            timing["decide"] = {k: round(a.decider.stats[k] - before[k], 3) for k in before}
+    hits = read_hits(hits, a.context, a.max_bytes)
+    t = time.time()
+    if a.rerank and chat:
+        hits = rerank(chat, question, hits, a.k)
+        timing["rerank_s"] = round(time.time() - t, 2)
+    if a.with_model or a.with_prose:
+        from . import align
+
+        t = time.time()
+        hits = hits + align.aligned_items(question, hits, a)
+        for i, h in enumerate(hits, 1):
+            h["rank"] = i
+        timing["aligned_s"] = round(time.time() - t, 2)
+    text = None
+    searches = []
+    if chat:
+        t = time.time()
+        if a.hops > 0:
+            for _ in range(a.hops):
+                reply = answer(chat, question, hits, ANSWER_SYSTEM_HOPS, await notes_for(hits, a))
+                queries = search_queries(reply)
+                if not queries:
+                    text = reply
+                    break
+                searches.append(queries)
+                hits = await follow(queries, hits, a)
+            else:
+                # still asking after the last hop: answer from everything gathered, without the option
+                text = answer(chat, question, hits, notes=await notes_for(hits, a))
+        else:
+            text = answer(chat, question, hits, notes=await notes_for(hits, a))
+        timing["answer_s"] = round(time.time() - t, 2)
+    calls = chat.usage["calls"] - before if chat else 0
+    return {"question": question, "answer": text, "hits": hits, "timing": timing,
+            "searches": searches, "calls": calls, "linked": linked, "pivot_concepts": pivots}
+
+
+def add_common(ap):
+    ap.add_argument("--db", type=Path, required=True)
+    ap.add_argument("--api-base", help="OpenAI-compatible base URL, e.g. https://api.openai.com/v1 (or DOCMEM_API_BASE)")
+    ap.add_argument("--api-key", help="its key (or DOCMEM_API_KEY); never stored")
+    ap.add_argument("--model", help="chat model name (or DOCMEM_MODEL)")
+    ap.add_argument("-k", type=int, default=6, help="passages given to the model")
+    ap.add_argument("--rerank", type=int, default=0, metavar="N",
+                    help="retrieve N candidates and let the chat model pick the best k (one extra call)")
+    ap.add_argument("--context", choices=("passage", "section"), default="passage",
+                    help="give the model each hit's passage, or its whole enclosing section")
+    ap.add_argument("--max-bytes", type=int, default=6000, help="cut a section read at this many bytes")
+    ap.add_argument("--no-answer", action="store_true", help="retrieval only; no chat model needed")
+    ap.add_argument("--split", type=int, default=0, metavar="N",
+                    help="for a question naming several subjects (A, B and C), also retrieve N passages for "
+                         "each part separately; no LLM; 0 = off")
+    ap.add_argument("--keywords", action="store_true",
+                    help="hybrid retrieval: fuse vector and keyword (BM25) results by reciprocal rank")
+    ap.add_argument("--terms", type=int, default=0, metavar="N",
+                    help="add up to N passages of other documents sharing the hits' rarest terms; no LLM")
+    ap.add_argument("--links", type=int, default=0, metavar="N",
+                    help="add up to N passages one link away from the hits (shared link targets, the "
+                         "linked document itself), ranked by similarity; no LLM; 0 = off")
+    ap.add_argument("--link-max-degree", type=int, default=50,
+                    help="do not follow targets linked from more passages than this (too common)")
+    ap.add_argument("--link-weights", choices=("none", "det", "decide"), default="none",
+                    help="--links ranking: none = the question's similarity; det = deterministic link weights "
+                         "(idf of the target, support from the hits, lead section, own article) mixed with the "
+                         "similarity by --link-lambda; no LLM; decide = a decision model (DOCMEM_DECIDER_*) picks, "
+                         "for each hit passage, the linked topic that would most help answer the question; its "
+                         "probabilities are the link weights (falls back to det when the model is unreachable)")
+    ap.add_argument("--link-lambda", type=float, default=0.5,
+                    help="--link-weights det or decide: weight of the link score against the similarity (0 to 1)")
+    ap.add_argument("--decider-cache", type=Path, metavar="FILE",
+                    help="--link-weights decide: cache the decisions in this JSONL file (hashes and results only), "
+                         "so a rerun asks the model nothing it has answered")
+    ap.add_argument("--decision-log", type=Path, metavar="FILE",
+                    help="--link-weights decide: append each decision (question, passage, options and their "
+                         "probabilities) to this JSONL file")
+    ap.add_argument("--concepts", type=int, default=0, metavar="N",
+                    help="add up to N passages of other documents sharing a concept (level 2 or deeper, from "
+                         "docmem classify) with the hits' documents, ranked by similarity; no LLM; 0 = off")
+    ap.add_argument("--concept-scheme", help="--concepts follows only this scheme's concepts (default: all)")
+    ap.add_argument("--pivot", type=int, default=0, metavar="N",
+                    help="retrieve through a concept: the concepts the question names (by label, or nearest by "
+                         "vector), then the best passage of each of up to N documents about them (document or "
+                         "section level); no LLM; 0 = off")
+    ap.add_argument("--pivot-scheme", help="--pivot uses only this scheme's concepts (default: all)")
+    ap.add_argument("--pivot-concepts", type=int, default=2, metavar="C",
+                    help="--pivot takes the C concepts nearest the question by vector, besides those it names")
+    ap.add_argument("--link-notes", action="store_true",
+                    help="tell the model how the excerpts are linked (shared link targets), from the graph")
+    ap.add_argument("--hops", type=int, default=0, metavar="N",
+                    help="multi-hop: when the model asks for SEARCH:, retrieve for each query and ask again, "
+                         "at most N times, then answer (at most N+1 answer calls); 0 = off")
+    ap.add_argument("--hop-k", type=int, default=3, help="passages retrieved per follow-up SEARCH query")
+    ap.add_argument("--max-passages", type=int, default=10,
+                    help="cap on the passages given to the model in total (multi-hop)")
+    ap.add_argument("--with-model", type=Path, metavar="ALIGNDIR",
+                    help="(prose DB) also add the model elements aligned to the hits' documents, their text read "
+                         "from --model-db; no LLM; docmem align builds ALIGNDIR")
+    ap.add_argument("--model-db", type=Path, help="the model DB --with-model reads the elements from")
+    ap.add_argument("--with-prose", type=Path, metavar="ALIGNDIR",
+                    help="(model DB) also add the prose passages aligned to the hits' elements, read from "
+                         "--prose-db; no LLM")
+    ap.add_argument("--prose-db", type=Path, help="the prose KB --with-prose reads the passages from")
+    ap.add_argument("--aligned", type=int, default=5, metavar="N",
+                    help="at most N aligned items of each kind added per question, and N query items per source")
+    ap.add_argument("--no-query-align", action="store_true",
+                    help="with --with-model / --with-prose: only the stored alignment, no search of the other DB "
+                         "with the question")
+
+
+def open_db(a):
+    if a.hops < 0 or a.hop_k < 1 or a.max_passages < 1:
+        raise SystemExit("docmem: --hops must be 0 or more; --hop-k and --max-passages at least 1")
+    if not 0 <= a.link_lambda <= 1:
+        raise SystemExit("docmem: --link-lambda must be between 0 and 1")
+    if a.pivot < 0 or a.pivot_concepts < 1:
+        raise SystemExit("docmem: --pivot must be 0 or more; --pivot-concepts at least 1")
+    if a.with_model and not a.model_db:
+        raise SystemExit("docmem ask: --with-model needs --model-db")
+    if a.with_prose and not a.prose_db:
+        raise SystemExit("docmem ask: --with-prose needs --prose-db")
+    a.decider = None
+    if a.link_weights == "decide":
+        from .decide import Decider
+
+        try:
+            a.decider = Decider.from_env(cache=a.decider_cache)
+        except DeciderError as e:
+            raise SystemExit(f"docmem: --link-weights decide: {e}")
+    store.configure(a.db, api_base=a.api_base or os.environ.get("DOCMEM_API_BASE"),
+                    api_key=a.api_key or os.environ.get("DOCMEM_API_KEY"))
+    from .llm import Chat
+
+    return None if a.no_answer else Chat(a.api_base, a.api_key, a.model)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="docmem ask", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_common(ap)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("question", nargs="+")
+    a = ap.parse_args(argv)
+    chat = open_db(a)
+    r = asyncio.run(ask_one(" ".join(a.question), a, chat))
+    if a.json:
+        print(json.dumps(r, ensure_ascii=False, indent=1))
+        return
+    for i, qs in enumerate(r["searches"], 1):
+        print(f"search {i}: " + " | ".join(qs))
+    if r["searches"]:
+        print()
+    if r["answer"] is not None:
+        print(r["answer"], "\n")
+    for i, h in enumerate(r["hits"], 1):
+        flag = "" if h["status"] == "ok" else f"  [{h['status'].upper()}: re-run scan | index]"
+        if h.get("found_by"):
+            flag += f"  [found by {h['found_by']}]"
+        elif h.get("via"):
+            flag += f"  [linked via {', '.join(h['via'][:3])}]"
+        link = f"{store.uri_path(h['uri'])}#L{h['line']}" if h["uri"].startswith("file:") else h["uri"]
+        dist = (f"{h['distance']:.3f}" if h.get('distance') is not None
+                else ("  aln " if h.get("aligned") else "  kw "))
+        print(f"[{i}] {dist}  {label(h)}{flag}\n     {link}")
+    print(f"\n{json.dumps(r['timing'])} calls={r['calls']}", file=sys.stderr)
+
+
+def stats_main(argv=None):
+    ap = argparse.ArgumentParser(prog="docmem stats")
+    ap.add_argument("--db", type=Path, required=True)
+    a = ap.parse_args(argv)
+    cfg = store.configure(a.db)
+
+    async def go():
+        graph, vector = await store.engines()
+        out = {"embed": cfg["embed"], "dims": cfg["dims"], "vector_backend": cfg["vector_backend"]}
+        for t in ("DocFile", "DocSection", "DocPassage", "DocSummary", "DocEntity", "DocTopic", "DocGap"):
+            nodes, _ = await graph.get_filtered_graph_data([{"type": [t]}], include_edges=False)
+            out[t] = len(nodes)
+        size = {}
+        for sub in (a.db / "system" / "databases").iterdir():
+            size[sub.name] = sum(f.stat().st_size for f in ([sub] if sub.is_file() else sub.rglob("*")) if f.is_file())
+        out["bytes"] = size
+        print(json.dumps(out, indent=1))
+
+    asyncio.run(go())

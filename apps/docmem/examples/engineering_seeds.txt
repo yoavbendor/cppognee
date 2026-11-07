@@ -1,0 +1,30 @@
+# Seed pages for docmem scan-wiki --seed-pages. One exact index title per line, "title|field" (field optional).
+# Every title was checked against the dump index (enwiki-latest-pages-articles-multistream-index).
+Glossary of mechanical engineering|mechanical
+Index of mechanical engineering articles|mechanical
+Outline of electrical engineering|electrical
+Index of electrical engineering articles|electrical
+Glossary of electrical and electronics engineering|electrical
+Outline of electronics|electronics
+Index of electronics articles|electronics
+Outline of computer engineering|computer
+Index of computing articles|computer
+Outline of software engineering|software
+Index of software engineering articles|software
+Glossary of automotive terms|automotive
+Outline of automobiles|automotive
+Outline of aerospace|aerospace
+Index of aviation articles|aerospace
+Glossary of aerospace engineering|aerospace
+Outline of transport|transport
+Outline of rail transport|transport
+Glossary of rail transport terms|transport
+Glossary of nautical terms|maritime
+Ship|maritime
+Outline of control engineering|control
+Outline of automation|control
+Outline of robotics|robotics
+Glossary of robotics|robotics
+Index of robotics articles|robotics
+List of named alloys|materials
+List of synthetic polymers|materials

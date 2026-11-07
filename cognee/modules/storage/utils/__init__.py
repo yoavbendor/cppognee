@@ -35,7 +35,17 @@ def copy_model(
         if name in exclude_fields:
             continue
 
-        if hasattr(field, "is_required") and field.is_required():
+        # Field(exclude=True) survives the copy: such a field (text that is only embedded) is
+        # readable on the copy but left out of model_dump(), so graph adapters do not store it.
+        if field.exclude is True:
+            if field.default_factory is not None:
+                spec = Field(default_factory=field.default_factory, exclude=True)
+            elif hasattr(field, "is_required") and field.is_required():
+                spec = Field(exclude=True)
+            else:
+                spec = Field(default=copy.deepcopy(field.default), exclude=True)
+            fields[name] = (field.annotation, spec)
+        elif hasattr(field, "is_required") and field.is_required():
             fields[name] = (field.annotation, PydanticUndefined)
         elif field.default_factory is not None:
             fields[name] = (field.annotation, Field(default_factory=field.default_factory))
