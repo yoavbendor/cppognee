@@ -204,6 +204,65 @@ docmem ask --db ~/kb_model --no-answer -k 5 "lunar module descent engine require
   skipped; their leading words are reported on stderr with `file:line` examples.
 - **`check_stream`:** the link kind `"model"` is not in `docmem.links.KINDS`, so `tools/check_stream.py` reports every
   link as `bad` until `"model"` is added there. The passage and link offsets themselves check out.
+- **KerML:** `.kerml` files are read by the same scanner (`format: "kerml"` on their doc record). Every file of a
+  tree is parsed before the command stops, so all parse failures are listed with `file:line`.
+
+### Metamodel, libraries and name resolution
+
+The model DB gets its semantics in three steps. Each writes to the model DB only.
+
+```sh
+# 1. the abstract syntax as a concept scheme (SKOS, 177 metaclasses from KerML.kerml, Metaobjects.kerml, SysML.sysml)
+python tools/import_sysml_metamodel.py --source SysML-v2-Release --out sysml_metamodel.ttl
+docmem ontology load --db $MODEL --skos sysml_metamodel.ttl --scheme sysmlmeta
+# 2. the standard libraries as a model of their own, indexed beside the model
+docmem scan-sysml SysML-v2-Release/sysml.library --model-name sysml-library > library.jsonl
+docmem index --db $MODEL library.jsonl
+# 3. resolve every reference (no LLM) and show an element
+docmem model-resolve --db $MODEL
+docmem model-show --db $MODEL "Apollo11::LunarModule"
+```
+
+- **Metamodel:** the release has no `.ecore` or `.uml`. Its abstract syntax is the reflective libraries: each
+  `metaclass X specializes Y` in KerML and each `metadata def X specializes Y` in SysML. A supertype that is not a
+  metaclass (KerML's `Objects::Object`) is counted and dropped from `broader`. A concept's definition is its doc
+  comment, which the release gives to only a few metaclasses, so most use their qualified name.
+- **Metaclass of an element:** an edge `element -metaclass-> concept` from the keyword of its declaration. The
+  keyword table is `KIND_METACLASS` in `sysml_resolve.py`. Modifiers that change no metaclass are notes
+  (`individual part def` is a `PartDefinition` with note `individual`). A keyword that is not in the table is
+  unmapped and listed in the report, with no edge. A bare `in x : T` (no keyword) is a `Feature`.
+- **Resolved edges** between sections: `r_typed_by`, `r_specializes`, `r_subsets`, `r_redefines`, `r_satisfy`
+  (satisfier to requirement, from `satisfy X by Y`, or the owner when there is no `by`), `r_allocate` (`allocate A to
+  B`: A to B) and `r_perform`. Each carries `as_written`, `file` and `line`. Re-running replaces them.
+- **Resolution rules** (`docmem/sysml_resolve.py`): a head name is looked up in the enclosing namespaces, innermost
+  first; in each: owned members, then inherited members (supertypes and typings, breadth first, so the most specific
+  wins), then imports. `import X::*` brings in the public members of X, `import X::**` also those of the namespaces X
+  owns, `import X::Y` just Y. An import is private unless `public import` is written, and only public imports are
+  re-exported. A segment after `::` is looked up among the members of the namespace before it.
+- **Implicit supertypes:** a definition or usage with no declared supertype takes the library base of its keyword
+  (`part` → `Parts::Part`, `connection` → `Connections::Connection`, and so on: `DEFAULT_SUPERTYPE`), and every type
+  has `Base::Anything` as its least specific supertype (KerML). `model-show` lists only the declared types: implicit
+  ones are not edges.
+- **Anonymous usages:** an unnamed usage with a body (`attribute :>> x { attribute :>> y; }`) is a scope for the names in
+  its body, through its own redefinitions and typings. It has no section, so a reference inside it resolves but writes
+  no edge (status `anonymous`). Its body's qualified names carry a `<anon OFFSET>` segment.
+- **Aliases:** `alias X for Y;` is an element of kind `alias`; a lookup that finds it continues at Y. Short names
+  (`<'FLR-R001'> Name`) are second keys of their element.
+- **What is approximated:** redefinition is matched by name, not by feature identity, and a feature with the same name
+  in two supertypes at the same depth is the first one written. Feature chains (`a.b.c`) look each segment up as a member
+  of the namespace before it, not of the feature's type, so `that.edges` is unresolved. A name that matches two elements
+  is ambiguous and stays unresolved, not guessed: `MagneticDipoleMomentUnit` in `SI.sysml` is one such case (two
+  definitions public-imported into `ISQ`). Import visibility defaults to private, as in KerML; the resolver assumes it.
+  Nested `import X::**` is followed through owned namespaces only. Qualified names are the scanner's, without the model
+  name: two models that declare one top-level package name share it. `subject`, `actor` and `stakeholder` have no usage
+  metaclass in the reflective model, so they are unmapped. `model-resolve` re-parses the source files because the graph
+  keeps no link offsets and no visibility; every parsed element must match a stored section (or the command stops), so
+  a stale index is caught rather than read.
+- **Not resolved:** successions and `end x [1] feature y` with a multiplicity before the keyword (`y` is not declared),
+  and KerML's implicit `that` and `self` where the scope does not reach `Base::Anything` (`subsets that`).
+- **`model-show`** reads only the graph: the metaclass and its ancestors in the metamodel, the owner, the types up to
+  the library roots, the owned features, and the inherited features (from every type, transitively, each name once,
+  from the most specific type, with redefinitions applied).
 
 ## What changed in cognee (this fork)
 

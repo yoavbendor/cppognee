@@ -2,9 +2,9 @@
 
     docmem scan-sysml ROOT [ROOT ...] [--model-name NAME]
 
-ROOT is a .sysml file or a directory (scanned recursively, hidden directories skipped). The model is only read and
-tokenized; nothing in it is executed. Output is the protocol stream: one "doc" per file (uri, sha256 of the file,
-extractor "", "format": "sysml", "model": NAME), then per file
+ROOT is a .sysml or .kerml file or a directory (scanned recursively, hidden directories skipped). The model is only read
+and tokenized; nothing in it is executed. Output is the protocol stream: one "doc" per file (uri, sha256 of the file,
+extractor "", "format": "sysml" or "kerml", "model": NAME), then per file
 
   section  one per named element (package, part def, part, requirement, attribute, ...): path = ["model", NAME,
            "package A", "requirement def B", ..., "<kind> <name>"] (the named enclosing elements, then its own
@@ -22,6 +22,10 @@ extractor "", "format": "sysml", "model": NAME), then per file
 
 Statements the scanner does not model (transitions, successions, expressions, ...) are skipped; their leading
 words are reported on stderr with file:line examples.
+
+An unnamed usage with a body (``attribute :>> x { attribute :>> y; }``) has no section. It is a scope for the names in
+its body: their qualified names carry a segment ``<anon OFFSET>`` (OFFSET: where the usage starts). The resolver
+(docmem.sysml_resolve) uses it; the stream's link targets name such an element by that qualified name.
 """
 
 import argparse
@@ -36,7 +40,7 @@ from typing import NamedTuple
 
 from . import PROTOCOL
 
-SUFFIX = ".sysml"
+SUFFIXES = (".sysml", ".kerml")  # SysML v2 and KerML textual files: one tokenizer, one grammar for both
 TOKEN = re.compile(
     rb"(?P<ws>\s+)"
     rb"|(?P<line>//[^\n]*)"
@@ -54,14 +58,17 @@ IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 VISIBILITY = frozenset({"private", "public", "protected"})
 MODIFIERS = VISIBILITY | {
     "abstract", "individual", "ref", "variation", "in", "out", "inout", "first", "then", "end", "return",
-    "derived", "readonly", "portion", "constant", "standard", "library",
+    "derived", "readonly", "portion", "constant", "standard", "library", "var", "const", "composite", "all",
 }
 RELATION_PREFIX = frozenset({"perform", "exhibit", "do"})  # a modifier only before an element keyword: do action x
 ELEMENT_KEYWORDS = frozenset({
     "package", "part", "port", "action", "state", "requirement", "item", "attribute", "interface",
     "connection", "constraint", "analysis", "verification", "view", "viewpoint", "subject", "actor",
     "stakeholder", "concern", "enum", "calc", "flow", "allocation", "occurrence", "metadata", "timeslice",
-    "snapshot", "event", "message",
+    "snapshot", "event", "message", "case",
+    # KerML declarations (the same grammar as SysML, in .kerml files and in the library)
+    "classifier", "feature", "type", "datatype", "class", "struct", "assoc", "behavior", "function",
+    "predicate", "connector", "binding", "metaclass", "namespace", "expr", "step", "interaction",
 })
 VERBS = frozenset({"satisfy", "verify", "allocate", "connect", "bind", "flow", "perform", "exhibit"})
 REDEFINES = frozenset({":>", ":>>", "::>"})  # specialization operators; ":>>" redefines, the others specialize
@@ -122,14 +129,23 @@ class Element:
         self.path, self.start, self.line = path, start, line
         self.end = start
         self.pieces: list[tuple[int, int, bool]] = []  # (start, end, is_header)
+        self.parent = ""  # the qualified name of the enclosing namespace ("" at the top level)
+        self.vis = "public"  # its visibility modifier, public when none is written
+        self.uri = ""
+        self.alias = None  # a short name (<'FLR-R001'> Name), which is a second name for the element
 
 
 class Ref:
-    __slots__ = ("start", "end", "text", "fragment", "chain", "target")
+    """A reference as written. owner: the Element whose header holds it (None for a body statement, whose owner is
+    the last name of its chain). stmt: the offset of the statement's first token, so `satisfy X by Y` pairs its names.
+    vis: an import's visibility (private when none is written, as in KerML)."""
 
-    def __init__(self, start, end, text, fragment, chain):
+    __slots__ = ("start", "end", "text", "fragment", "chain", "target", "owner", "stmt", "vis")
+
+    def __init__(self, start, end, text, fragment, chain, owner=None, stmt=None, vis="public"):
         self.start, self.end, self.text, self.fragment, self.chain = start, end, text, fragment, chain
         self.target = text
+        self.owner, self.stmt, self.vis = owner, stmt, vis
 
 
 class _File:
@@ -142,6 +158,7 @@ class _File:
         self.n = len(self.toks)
         self.root_path = ["model", model.name]
         self.elements: list[Element] = []
+        self.anon: list[Element] = []  # unnamed usages with a body: scopes for name lookup only (no section)
         self.refs: list[Ref] = []
         self.unmodelled: list[tuple[int, str]] = []
         self.stray = 0
@@ -253,9 +270,13 @@ class _File:
         while j < n and toks[j].kind == "id" and toks[j].text in VISIBILITY:
             j += 1
         if j < n and toks[j].kind == "id" and toks[j].text == "import":
-            return self.import_stmt(j, chain)
+            vis = toks[i].text if j > i else "private"  # imports are private unless "public import" says otherwise
+            return self.import_stmt(j, chain, vis)
         if j < n and toks[j].kind == "id" and toks[j].text in TEXT_WORDS:
             return self.text_stmt(j, owner)
+        if j + 3 < n and toks[j].kind == "id" and toks[j].text == "alias" and toks[j + 1].kind in ("id", "q") \
+                and toks[j + 2].kind == "id" and toks[j + 2].text == "for":
+            return self.alias_stmt(j, owner, chain)
         if j + 3 < n and toks[j].kind == "id" and is_p(toks[j + 1], "=") and toks[j + 2].kind == "str" \
                 and is_p(toks[j + 3], ";"):
             self.piece(owner, toks[j].start, toks[j + 3].end)  # text = "..."; in a metadata body
@@ -278,8 +299,12 @@ class _File:
         """:>> name ... / :> name ...: a usage that redefines or specializes a feature of its owner's type."""
         name_tok = self.toks[j + 1]
         frag, kind = ("redefines", "redefinition") if self.toks[j].text == ":>>" else ("specializes", "specialization")
+        n_ref, n_el = len(self.refs), len(self.elements)
         self.refs.append(Ref(name_tok.start, name_tok.end, name_tok.text, frag, chain))
-        return self.usage(i, kind, "", name_tok, j + 2, None, owner, chain)
+        nxt = self.usage(i, kind, "", name_tok, j + 2, None, owner, chain)
+        if len(self.elements) > n_el:  # the usage it declares is the owner of its redefined name
+            self.refs[n_ref].owner = self.elements[n_el]
+        return nxt
 
     def declaration(self, mstart: int, k: int, owner, chain: list, generic: bool) -> int:
         toks, n = self.toks, self.n
@@ -295,6 +320,14 @@ class _File:
             words = mods + [kw]
             if m < n and toks[m].kind == "id" and toks[m].text == "def":
                 words.append("def")
+                m += 1
+            while m < n and toks[m].kind == "id" and toks[m].text == "all":  # assoc all X, struct all X (KerML)
+                words.append("all")
+                m += 1
+            # a second keyword before the name (abstract assoc struct X): both are the kind
+            while m + 1 < n and toks[m].kind == "id" and toks[m].text in ELEMENT_KEYWORDS \
+                    and (toks[m + 1].kind in ("id", "q") or is_p(toks[m + 1], "<")):
+                words.append(toks[m].text)
                 m += 1
             kind = " ".join(words)
             if m < n and is_p(toks[m], "<"):  # a short name: <'FLR-R001'> Name
@@ -319,35 +352,52 @@ class _File:
             name, alias = short, None
         verb = kw if kw in VERBS else None
         hend, term = self.header_end(hstart, eq_term=(kw != "bind"))
-        self.header_refs(hstart, hend, verb, verb if name_tok is None else None, chain)
         if name is None:
-            _, nxt = self.finish(term, hend, owner, chain, chain)
+            # an unnamed usage with a body (attribute :>> x { attribute :>> y; }) is a namespace for the names in its
+            # body, which its own redefinitions or typings supply. It is not an element: it has no section.
+            anon = None
+            if term == "{" and kw and verb is None:
+                parent = chain[-1]
+                qn = f"{parent}::<anon {mstart}>" if parent else f"<anon {mstart}>"
+                anon = Element(kind, kw, None, qn, owner.path if owner else self.root_path, toks[mstart].start,
+                               self.line_of(toks[mstart].start))
+                anon.parent, anon.uri = parent, self.uri
+                self.anon.append(anon)
+            self.header_refs(hstart, hend, verb, verb, chain, owner=anon, stmt=mstart)
+            end_tok, nxt = self.finish(term, hend, owner, chain + ([anon.qname] if anon else []), chain,
+                                       header_owner=anon)
+            if anon is not None:
+                anon.end = toks[end_tok].end
             return nxt
         parent = chain[-1]
         qname = f"{parent}::{name}" if parent else name
         start = toks[mstart].start
         el = Element(kind, kw, name, qname, (owner.path if owner else self.root_path) + [f"{kind} {name}"],
                      start, self.line_of(start))
+        el.parent, el.uri, el.alias = parent, self.uri, alias
+        el.vis = next((t.text for t in toks[mstart:hstart] if t.kind == "id" and t.text in VISIBILITY), "public")
         self.elements.append(el)
         self.model.declare(parent, name, qname)
         if alias is not None:
             self.model.declare(parent, alias, qname)
+        self.header_refs(hstart, hend, verb, None, chain, owner=el, stmt=mstart)
         head_end = hend if term in ("{", ";") else hend - 1
         el.pieces.append((start, toks[head_end].end, True))
-        end_tok, nxt = self.finish(term, hend, el, chain + [qname], chain)
+        end_tok, nxt = self.finish(term, hend, el, chain + [qname], chain, header_owner=el)
         el.end = toks[end_tok].end
         return nxt
 
-    def finish(self, term: str, hend: int, owner, chain: list, ref_chain: list):
+    def finish(self, term: str, hend: int, owner, chain: list, ref_chain: list, header_owner=None):
         """(index of the last token of the statement, index after it) for the header's terminator. ref_chain is
-        the namespace the header's names resolve in; after a body, `} :> x;` adds specializations to the header."""
+        the namespace the header's names resolve in; after a body, `} :> x;` adds specializations to the header
+        (of header_owner, when the statement declares an element)."""
         toks = self.toks
         if term == "{":
             close = self.members(hend + 1, owner, chain, True)
             if close < self.n and toks[close].kind == "p" and toks[close].text in REDEFINES:
                 hend2, term2 = self.header_end(close, eq_term=True)
-                self.header_refs(close, hend2, None, None, ref_chain)
-                return self.finish(term2, hend2, owner, chain, ref_chain)
+                self.header_refs(close, hend2, None, None, ref_chain, owner=header_owner, stmt=close)
+                return self.finish(term2, hend2, owner, chain, ref_chain, header_owner)
             return close - 1, close
         if term == ";":
             return hend, hend + 1
@@ -387,7 +437,7 @@ class _File:
             k += 1
         self.fail(m, "unexpected end of file")
 
-    def header_refs(self, k: int, hend: int, verb, frag, chain: list):
+    def header_refs(self, k: int, hend: int, verb, frag, chain: list, owner=None, stmt=None):
         """Record the names in a header: typing (:), specialization (:>, :>>, specializes, subsets, redefines) and
         the relation words (to, by, from, of) with the verb in front of them."""
         toks, m = self.toks, k
@@ -421,7 +471,7 @@ class _File:
                 frag = verb
             elif frag is not None and t.kind in ("id", "q") and t.text not in HEADER_SKIP:
                 e, text = self.qname(m)
-                self.refs.append(Ref(t.start, self.toks[e - 1].end, text, frag, chain))
+                self.refs.append(Ref(t.start, self.toks[e - 1].end, text, frag, chain, owner, stmt))
                 m = e
                 if not (m < hend and is_p(toks[m], ",")):
                     frag = None
@@ -435,7 +485,7 @@ class _File:
                 and self.toks[m].text == "requirement":
             m += 1
         hend, term = self.header_end(m, eq_term=(verb != "bind"))
-        self.header_refs(m, hend, verb, verb, chain)
+        self.header_refs(m, hend, verb, verb, chain, stmt=k)
         return self.finish(term, hend, owner, chain, chain)[1]
 
     def metadata(self, i: int, owner, chain: list) -> int:
@@ -444,18 +494,46 @@ class _File:
             self.fail(i, "'#' is not followed by a metadata name")
         name = self.toks[i + 1].text
         hend, term = self.header_end(i + 2, eq_term=True)
-        self.header_refs(i + 2, hend, name, name, chain)
+        self.header_refs(i + 2, hend, name, name, chain, stmt=i)
         return self.finish(term, hend, owner, chain, chain)[1]
 
-    def import_stmt(self, j: int, chain: list) -> int:
+    def import_stmt(self, j: int, chain: list, vis: str) -> int:
         toks, m = self.toks, j + 1
         if m < self.n and toks[m].kind in ("id", "q"):
             e, text = self.qname(m)
-            self.refs.append(Ref(toks[m].start, toks[e - 1].end, text, "import", chain))
+            self.refs.append(Ref(toks[m].start, toks[e - 1].end, text, "import", chain, vis=vis))
             m = e
         while m < self.n and not is_p(toks[m], ";", "}"):
             m += 1
         return m + 1 if m < self.n and is_p(toks[m], ";") else m
+
+    def alias_stmt(self, j: int, owner, chain: list) -> int:
+        """alias X for Y; (KerML): X is a second name of the element Y. X is declared like a named element, of kind
+        "alias", and its target is an "alias_for" reference, resolved in the namespace the alias sits in."""
+        toks, n = self.toks, self.n
+        name_tok = toks[j + 1]
+        parent = chain[-1]
+        qname = f"{parent}::{name_tok.text}" if parent else name_tok.text
+        start = toks[j].start
+        el = Element("alias", "alias", name_tok.text, qname, (owner.path if owner else self.root_path)
+                     + [f"alias {name_tok.text}"], start, self.line_of(start))
+        el.parent, el.uri = parent, self.uri
+        self.elements.append(el)
+        self.model.declare(parent, name_tok.text, qname)
+        e, text = self.qname(j + 3)
+        self.refs.append(Ref(toks[j + 3].start, toks[e - 1].end, text, "alias_for", chain, owner=el))
+        if e < n and is_p(toks[e], "{"):  # alias X for Y { doc /* ... */ }: its body is text of the alias
+            close = self.members(e + 1, el, chain, True)
+            el.end = toks[close - 1].end
+            el.pieces.append((start, toks[e - 1].end, True))
+            return close
+        m = e
+        while m < n and not is_p(toks[m], ";", "}"):
+            m += 1
+        end_tok = m if m < n and is_p(toks[m], ";") else e - 1
+        el.end = toks[end_tok].end
+        el.pieces.append((start, toks[e - 1].end, True))
+        return end_tok + 1 if end_tok == m else m
 
     def text_stmt(self, j: int, owner) -> int:
         """require / assume / assert statements: their text is text of the enclosing element."""
@@ -501,12 +579,18 @@ class _File:
         toks, m = self.toks, i
         if warn:
             self.unmodelled.append((self.line_of(toks[i].start), toks[i].text))
+        value = False  # after "=" the braces are an expression (x->select {in x; f(x)}), not members
         while m < self.n:
             t = toks[m]
             if is_p(t, "}"):
                 return m
             if is_p(t, ";"):
                 return m + 1
+            if is_p(t, "="):
+                value = True
+            if is_p(t, "{") and value:
+                m = self.skip_balanced(m)
+                continue
             if is_p(t, "{"):
                 m = self.members(m + 1, owner, chain, True)
                 if m < self.n and is_p(toks[m], "->"):
@@ -560,7 +644,7 @@ class Model:
 
     def records(self):
         for f in self.files:
-            yield {"type": "doc", **f.doc, "extractor": "", "format": "sysml", "model": self.name}
+            yield {"type": "doc", **f.doc, "extractor": "", "format": f.doc.get("format", "sysml"), "model": self.name}
             for el in f.elements:
                 yield {"type": "section", "uri": f.uri, "path": el.path, "level": len(el.path) - 1,
                        "offset": el.start, "length": el.end - el.start, "line": el.line}
@@ -599,11 +683,17 @@ class Model:
                 "unmodelled_examples": {w: examples[w] for w, _ in unmodelled.most_common(20)}}
 
 
-def parse_model(sources: list, model_name: str) -> Model:
-    """sources: (doc, bytes) per file, doc holding uri, sha256, size, mtime and title."""
+def parse_model(sources: list, model_name: str, errors: list | None = None) -> Model:
+    """sources: (doc, bytes) per file, doc holding uri, sha256, size, mtime and title. A file that fails to parse
+    raises ScanError, unless errors is given: then its message is appended to it and the file is left out."""
     model = Model(model_name)
     for doc, data in sources:
-        model.files.append(_File(doc, data, model))
+        try:
+            model.files.append(_File(doc, data, model))
+        except ScanError as e:
+            if errors is None:
+                raise
+            errors.append(str(e))
     for f in model.files:
         for r in f.refs:
             r.target = model.resolve(r.text, r.chain)
@@ -614,7 +704,7 @@ def iter_files(roots):
     for root in roots:
         p = Path(root)
         if p.is_dir():
-            yield from sorted(f for f in p.rglob("*") if f.is_file() and f.suffix.lower() == SUFFIX
+            yield from sorted(f for f in p.rglob("*") if f.is_file() and f.suffix.lower() in SUFFIXES
                               and not any(part.startswith(".") for part in f.relative_to(p).parts))
         elif p.is_file():
             yield p
@@ -636,12 +726,13 @@ def main(argv=None):
     for p in paths:
         data = p.read_bytes()
         doc = {"uri": p.resolve().as_uri(), "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
-               "mtime": p.stat().st_mtime, "title": p.stem}
+               "mtime": p.stat().st_mtime, "title": p.stem,
+               "format": "kerml" if p.suffix.lower() == ".kerml" else "sysml"}
         sources.append((doc, data))
-    try:
-        model = parse_model(sources, name)
-    except ScanError as e:
-        raise SystemExit(f"docmem scan-sysml: {e}")
+    errors: list[str] = []
+    model = parse_model(sources, name, errors)
+    if errors:  # every file is parsed, so each failure is reported with its file:line
+        raise SystemExit("docmem scan-sysml: %d file(s) failed to parse:\n%s" % (len(errors), "\n".join(errors)))
     out = sys.stdout
     out.write(json.dumps({"type": "scan_start", "protocol": PROTOCOL}) + "\n")
     for rec in model.records():

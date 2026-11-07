@@ -5,6 +5,8 @@ USAGE = """usage: docmem <command> ...
   scan   cut markdown files into sections and passages (JSON lines on stdout)
   scan-wiki  a random sample of English Wikipedia articles, read from the dump (JSON lines on stdout)
   scan-sysml a SysML v2 textual model as JSON lines, for a model DB only (never a prose DB)
+  model-resolve  resolve a model DB's references to qualified names; write the edges and metaclasses (no LLM)
+  model-show     one model element: metaclass, owner, types, owned and inherited features
   index  store a scan's stream (stdin) in cognee: vectors and provenance, no text
   ask    answer a question from the index, reading the passages back from the files
   eval   run a question set and score retrieval and answers
@@ -31,6 +33,10 @@ def main():
         from .scan_wiki import main as m
     elif cmd == "scan-sysml":
         from .scan_sysml import main as m
+    elif cmd == "model-resolve":
+        from .sysml_resolve import resolve_main as m
+    elif cmd == "model-show":
+        from .sysml_resolve import show_main as m
     elif cmd == "index":
         from .index import main as m
     elif cmd == "ask":
