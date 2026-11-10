@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Any, TypeGuard
 
 from cognee.infrastructure.llm.config import get_llm_context_config
+from cognee.infrastructure.llm.egress_check import check_provider_endpoint
 from cognee.infrastructure.llm.exceptions import (
     LLMAPIKeyNotSetError,
     UnsupportedLLMProviderError,
@@ -211,6 +212,7 @@ def _get_llm_client_cached(cache_key: _LLMClientCacheKey) -> LLMInterface:
     # so the first context to populate a given key bakes in the correct secret.
     llm_config = get_llm_context_config()
     provider = LLMProvider(cache_key.provider)
+    check_provider_endpoint(cache_key.provider, cache_key.endpoint or None, "llm")
     llm_api_key: str = llm_config.llm_api_key or ""
     llm_args = _unfreeze_from_cache(cache_key.llm_args) or {}
     max_completion_tokens = cache_key.max_completion_tokens

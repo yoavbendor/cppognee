@@ -696,7 +696,8 @@ class LadybugAdapter(GraphDBInterface):
                     "Graph queries that use JSON (e.g. recall, temporal search) will "
                     "fail with 'Extension: json ... has not been installed'. Populate "
                     "cognee_db_workers/ladybug_extensions/ (see its README), ensure the "
-                    "process has network access at startup, or run `INSTALL json; LOAD "
+                    "process has network access at startup (or allow extension.ladybugdb.com in "
+                    "the egress policy, COGNEE_EGRESS_POLICY), or run `INSTALL json; LOAD "
                     "json;` once against the database.",
                     e,
                     exc_info=True,

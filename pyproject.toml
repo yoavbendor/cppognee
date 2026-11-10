@@ -323,7 +323,7 @@ exclude = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["cognee", "cognee_db_workers", "kuzu"]
+packages = ["cognee", "cognee_db_workers", "cognee_egress", "kuzu"]
 
 [tool.uv]
 # Note: exclude newer packages that are less than 2 days old
