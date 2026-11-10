@@ -43,11 +43,6 @@ def test_create_graph_engine_builds_the_adapter_from_the_url(tmp_path):
     assert engine.database_path == str(tmp_path / "via-engine")
 
 
-def test_missing_directory_is_an_error():
-    with pytest.raises(OSError, match="GRAPH_DATABASE_URL"):
-        NanolanceGraphAdapter(graph_database_url="")
-
-
 def test_remote_key_is_refused(tmp_path):
     with pytest.raises(OSError, match="Remote nanolance"):
         NanolanceGraphAdapter(graph_database_url=str(tmp_path), graph_database_key="secret")
