@@ -1,9 +1,11 @@
 """Graph adapter that keeps cognee's graph in two nanolance (Lance-format) tables.
 
 ``GRAPH_DATABASE_URL`` is the directory holding ``nodes.lance`` and ``edges.lance``.
-Blocking Lance work runs in worker threads (``asyncio.to_thread``); writes are
-serialized per adapter by an asyncio lock, and every operation opens the tables at
-their current version, so several adapters on one directory see each other's writes.
+Blocking Lance work runs in worker threads (``asyncio.to_thread``). Writes are serialized
+per adapter by an asyncio lock and across processes by a file lock (``.write.lock`` in the
+graph directory); every write reads the tables after taking the file lock, and every
+operation opens the tables at their current version, so writers on one directory see each
+other's writes. Reads take no lock.
 """
 
 import asyncio
@@ -17,6 +19,7 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
+from filelock import FileLock
 from nanolance import lance
 
 from cognee.exceptions import CogneeValidationError
@@ -54,6 +57,8 @@ from .tables import (
 
 logger = get_logger()
 
+# Cross-process lock file inside the graph directory; held around every write.
+_WRITE_LOCK_FILE = ".write.lock"
 # IN lists are sent to the Lance filter parser in slices of this size.
 _IN_CHUNK = 500
 _NODE_READ = ("id", "name", "type", "properties")
@@ -361,13 +366,24 @@ class NanolanceGraphAdapter(GraphDBInterface):
             return
         async with self._write_lock:
             if not self._initialized:
-                await asyncio.to_thread(self._t_create_tables)
+                await asyncio.to_thread(self._t_locked, self._t_create_tables)
                 self._initialized = True
 
     async def _write(self, operation, *args):
         """Run a blocking write under the adapter's write lock and return its result."""
         async with self._write_lock:
-            return await asyncio.to_thread(operation, *args)
+            return await asyncio.to_thread(self._t_locked, operation, *args)
+
+    def _t_locked(self, operation, *args):
+        """Run ``operation`` while holding the graph directory's cross-process file lock.
+
+        Runs in a worker thread so the event loop never waits on the lock. The lock is taken
+        before any table is read, and every read opens the newest table version, so the
+        read-modify-write inside ``operation`` sees writes made by other processes.
+        """
+        os.makedirs(self.database_path, exist_ok=True)
+        with FileLock(os.path.join(self.database_path, _WRITE_LOCK_FILE)):
+            return operation(*args)
 
     # ------------------------------------------------------------------ writes (threads)
 
