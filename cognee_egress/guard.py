@@ -29,6 +29,9 @@ from .policy import EgressPolicy, HostRule, Phase, PolicyError, is_loopback, loa
 
 PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 SERVICE_PORTS = {"http": 80, "https": 443}
+# Programs every policy allows: local, no network. ldconfig -p is how ctypes.util.find_library looks
+# up shared libraries (cognee_db_workers uses it to find libc).
+ALWAYS_ALLOWED_PROGRAMS = frozenset({"ldconfig"})
 PY_CHILD_MODULES = ("cognee", "cognee_db_workers", "cognee_egress", "docmem")
 HTTP_METHODS = (
     b"GET",
@@ -170,7 +173,7 @@ class _Guard:
         if _is_python(program) and _python_child_ok(argv):
             self.decide("exec", name, True)
             return
-        ok = name in self.phase.subprocesses
+        ok = name in self.phase.subprocesses or name in ALWAYS_ALLOWED_PROGRAMS
         self.decide(
             "exec",
             " ".join([name, *argv[1:3]])[:200],

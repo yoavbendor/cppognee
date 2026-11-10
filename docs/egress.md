@@ -44,6 +44,7 @@ Start from `docs/egress.example.json`:
   look into without breaking it, so treat this as a second line: the first is to allow only mirrors
   you trust, such as an Artifactory remote repository in front of PyPI or Hugging Face.
 - `subprocesses`: executable basenames cognee may start (for example `enola` for code graphs).
+  `ldconfig` is always allowed: it only reads the local library cache (Python's `ctypes` uses it).
   Python children are allowed only for multiprocessing and cognee's own modules, which load the
   guard again. A program you list here runs outside level 2: list networking programs (`git`,
   `curl`, `uv`) only under level 3.

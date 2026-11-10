@@ -134,6 +134,8 @@ def test_subprocess_rules(tmp_path):
             tmp_path,
             """
             subprocess.run(['true'], check=True)
+            import ctypes.util; ctypes.util.find_library('c')  # runs ldconfig -p
+            assert not denied(lambda: subprocess.run(['ldconfig', '-p'], capture_output=True))
             assert denied(lambda: subprocess.run(['git', '--version']))
             assert denied(lambda: subprocess.run('true', shell=True))
             assert denied(lambda: subprocess.run([sys.executable, '-m', 'pip', '--version']))
