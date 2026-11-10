@@ -289,6 +289,101 @@ async def scenario_update_chunk_index(g) -> dict:
     return {"nodes": await g.get_nodes(["c1", "c2", "ghost"])}
 
 
+async def scenario_top_degree_seeds(g) -> dict:
+    await g.add_nodes([_node(i) for i in ["hub", "a", "b", "c", "iso"]])
+    await g.add_edges(
+        [
+            ("hub", "a", "r", {}),
+            ("hub", "b", "r", {}),
+            ("hub", "c", "r", {}),
+            ("a", "b", "s", {}),
+            ("c", "a", "s", {}),
+        ]
+    )
+    # Degrees: a 3, hub 3, b 2, c 2 (ties by id); iso is only a fill candidate.
+    all_seeds = await g.get_top_degree_node_ids(5)
+    return {
+        "top1": await g.get_top_degree_node_ids(1),
+        "top3": await g.get_top_degree_node_ids(3),
+        "top5_ranked": all_seeds[:4],
+        "top5_len": len(all_seeds),
+    }
+
+
+async def scenario_entity_type_names(g) -> dict:
+    await g.add_nodes(
+        [
+            _node("e1", typ="Entity"),
+            _node("e2", typ="Entity"),
+            _node("e3", typ="Entity"),
+            _node("person", name="Person", typ="EntityType"),
+            _node("place", name="Place", typ="EntityType"),
+            _node("thing", name="Thing", typ="Node"),
+        ]
+    )
+    await g.add_edges(
+        [
+            ("e1", "person", "is_a", {}),
+            ("e2", "place", "is_a", {}),
+            ("e2", "thing", "is_a", {}),  # target is not an EntityType
+            ("e3", "person", "rel", {}),  # not is_a
+            ("place", "e3", "is_a", {}),  # wrong direction
+        ]
+    )
+    return await g.get_entity_type_names(["e1", "e2", "e3", "person", "ghost"])
+
+
+async def scenario_temporal_anchors(g) -> dict:
+    await g.add_nodes(
+        [
+            _node("c1", typ="DocumentChunk"),
+            _node("c2", typ="DocumentChunk"),
+            _node("c3", typ="DocumentChunk"),
+            _node("c4", typ="DocumentChunk"),
+            _node("e1", typ="Entity"),
+            _node("e2", typ="Entity"),
+            _node("e3", typ="Entity"),
+            _node("t_in", typ="Timestamp", props={"time_at": 1000, "time_until": 2000}),
+            _node("t_out", typ="Timestamp", props={"time_at": 5000, "time_until": 6000}),
+            _node("t_open", typ="Timestamp", props={"time_at": 1550}),  # time_until defaults
+            _node("p", typ="Person", props={"time_at": 1200, "time_until": 1300}),
+        ]
+    )
+    await g.add_edges(
+        [
+            ("c1", "e1", "contains", {}),
+            ("e1", "t_in", "born_at", {}),
+            ("c2", "t_in", "mentions", {}),
+            ("c3", "e2", "contains", {}),
+            ("e2", "t_out", "died_at", {}),
+            ("c3", "p", "mentions", {}),
+            ("c4", "e3", "contains", {}),
+            ("e3", "t_open", "began_at", {}),
+            ("c4", "t_in", "mentions", {}),
+        ]
+    )
+    chunks = ["c1", "c2", "c3", "c4"]
+    entities = ["e1", "e2"]
+    windows = [(1500, 1600), (None, None), (5500, None), (2000, 5000), (1000, 1001)]
+    return {str(w): await g.get_temporal_anchors(chunks, entities, *w) for w in windows}
+
+
+async def scenario_triplets_batch(g) -> dict:
+    await g.add_nodes(
+        [_node("a", props={"v": 1}), _node("b", props={"v": 2}), _node("c"), _node("d")]
+    )
+    await g.add_edges(
+        [
+            ("b", "a", "z", {"w": 1}),
+            ("a", "c", "r", {}),
+            ("a", "b", "r", {"w": 2}),
+            ("c", "d", "r", {"w": 3}),
+        ]
+    )
+    pages = [(0, 2), (2, 2), (1, 10), (0, 0), (9, 1)]
+    return {str(page): await g.get_triplets_batch(*page) for page in pages}
+
+
 SCENARIOS = [
     scenario_attach_find_remove,
     scenario_fold_stamps_on_write,
@@ -301,6 +396,10 @@ SCENARIOS = [
     scenario_truth_state,
     scenario_update_node,
     scenario_update_chunk_index,
+    scenario_top_degree_seeds,
+    scenario_entity_type_names,
+    scenario_temporal_anchors,
+    scenario_triplets_batch,
 ]
 
 

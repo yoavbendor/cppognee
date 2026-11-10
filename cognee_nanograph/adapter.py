@@ -20,8 +20,10 @@ import pyarrow.compute as pc
 from nanolance import lance
 
 from cognee.exceptions import CogneeValidationError
+from cognee.infrastructure.databases.graph.degree_seeds import EDGE_SAMPLE_ROWS
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
+    temporal_anchors_from_rows,
     timestamp_overlaps,
 )
 from cognee.infrastructure.databases.provenance import EdgeDeleteData, EdgeIdentity, NodeDeleteData
@@ -650,6 +652,128 @@ class NanolanceGraphAdapter(GraphDBInterface):
                 }
             )
         return sorted(result, key=lambda item: (item["time_at"], item["id"]))
+
+    def _t_overlapping_timestamps(self, node_ids: list[str], start, end) -> set[str]:
+        """The ids among ``node_ids`` that are Timestamp rows overlapping ``[start, end)``."""
+        rows = self._t_rows_where(NODES_TABLE, "id", node_ids, ("id", "properties"))
+        return {
+            row["id"]
+            for row in rows
+            if timestamp_overlaps({**_props_blob(row["properties"]), "id": row["id"]}, start, end)
+        }
+
+    def _t_edge_triples(self, node_ids: Iterable[str], edge_types: list[str] | None) -> list:
+        """``(source, target, relationship)`` of every edge touching ``node_ids``."""
+        table = self._t_edges_touching(node_ids, edge_types)
+        return list(
+            zip(
+                table["source_id"].to_pylist(),
+                table["target_id"].to_pylist(),
+                table["relationship_name"].to_pylist(),
+            )
+        )
+
+    def _t_entity_type_names(self, entity_ids: list[str]) -> dict[str, str]:
+        members = set(entity_ids)
+        is_a = [(s, t) for s, t, _ in self._t_edge_triples(entity_ids, ["is_a"]) if s in members]
+        names = {
+            row["id"]: row["name"]
+            for row in self._t_rows_where(
+                NODES_TABLE, "id", _unique(t for _, t in is_a), ("id", "name", "type")
+            )
+            if row["type"] == "EntityType" and row["name"]
+        }
+        return {s: names[t] for s, t in is_a if t in names}
+
+    def _t_top_degree_node_ids(self, top_k: int) -> list[str]:
+        """Degree ranking over the first ``EDGE_SAMPLE_ROWS`` edges, then nodes to fill up.
+
+        The same bounded sample Ladybug ranks (``cypher_degree_seeds``): ties go to the
+        smaller id, and the fill takes any nodes not already ranked.
+        """
+        sample = self._open(EDGES_TABLE).head(EDGE_SAMPLE_ROWS, columns=["source_id", "target_id"])
+        ends = pa.concat_arrays(
+            [sample["source_id"].combine_chunks(), sample["target_id"].combine_chunks()]
+        )
+        counts = pc.value_counts(pc.drop_null(ends))
+        ranked = pa.table({"id": counts.field("values"), "degree": counts.field("counts")}).sort_by(
+            [("degree", "descending"), ("id", "ascending")]
+        )
+        seeds = ranked["id"].slice(0, top_k).to_pylist()
+        if len(seeds) < top_k:
+            # Any top_k nodes hold at most len(seeds) ranked ids, so this leaves enough.
+            ids = self._open(NODES_TABLE).to_table(columns=["id"], limit=top_k)["id"].to_pylist()
+            ranked_ids = set(seeds)
+            fill = [i for i in ids if i not in ranked_ids]
+            seeds.extend(fill[: top_k - len(seeds)])
+        return seeds
+
+    def _t_temporal_anchors(
+        self, chunk_ids: list[str], entity_ids: list[str], start, end
+    ) -> dict[str, set[str]]:
+        chunks = _unique(chunk_ids)
+        candidates = set(_unique([*chunks, *entity_ids]))
+        if not candidates:
+            return temporal_anchors_from_rows([], [], [])
+        chunk_set = set(chunks)
+        hops = [(s, t, r) for s, t, r in self._t_edge_triples(candidates, None) if s in candidates]
+        contains = {(s, t) for s, t, r in hops if s in chunk_set and r == "contains"}
+        reached = _unique(entity for _, entity in contains)
+        reached_set = set(reached)
+        onward = [(s, t) for s, t, _ in self._t_edge_triples(reached, None) if s in reached_set]
+        targets = _unique([t for _, t, _ in hops] + [t for _, t in onward])
+        types = {
+            row["id"]: row["type"]
+            for row in self._t_rows_where(NODES_TABLE, "id", targets, ("id", "type"))
+        }
+        in_window = self._t_overlapping_timestamps(
+            [t for t in targets if types.get(t) == "Timestamp"], start, end
+        )
+        direct_rows = [(s, t) for s, t, _ in hops if t in in_window]
+        stamps_by_entity: dict[str, set[str]] = defaultdict(set)
+        for entity, stamp in onward:
+            if stamp in in_window:
+                stamps_by_entity[entity].add(stamp)
+        via_rows = [
+            (chunk, entity, stamp)
+            for chunk, entity in contains
+            if types.get(entity) == "Entity"
+            for stamp in stamps_by_entity.get(entity, ())
+        ]
+        return temporal_anchors_from_rows(direct_rows, via_rows, chunks)
+
+    def _t_triplets_page(self, offset: int, limit: int) -> list[dict[str, Any]]:
+        """One page of edges ordered by (source id, target id, relationship), with their nodes.
+
+        Only the three key columns are read for the ordering; the page's rows are then taken
+        whole. Ladybug's ORDER BY ranks the same way, so offsets name the same triplets.
+        """
+        ds = self._open(EDGES_TABLE)
+        keys = ds.to_table(columns=["source_id", "target_id", "relationship_name"])
+        order = pc.sort_indices(
+            keys,
+            sort_keys=[
+                ("source_id", "ascending"),
+                ("target_id", "ascending"),
+                ("relationship_name", "ascending"),
+            ],
+        )
+        positions = order[offset : offset + limit].to_pylist()
+        if not positions:
+            return []
+        edges = self._edge_tuples(ds.take(positions, columns=list(_EDGE_READ)))
+        node_ids = _unique(part for source, target, _, _ in edges for part in (source, target))
+        nodes = {node["id"]: node for node in self._node_dicts(self._t_nodes_by_ids(node_ids))}
+        return [
+            {
+                "start_node": nodes[source],
+                "relationship_properties": {**props, "relationship_name": relationship},
+                "end_node": nodes[target],
+            }
+            for source, target, relationship, props in edges
+            # An endpoint that is not in the nodes table drops the triplet, as in Ladybug's MATCH.
+            if source in nodes and target in nodes
+        ]
 
     def _t_ids_with_member(self, table: str, column: str, value: str, columns) -> list[dict]:
         """Rows whose list column ``column`` contains ``value`` (pushed down to Lance)."""
@@ -1473,3 +1597,41 @@ class NanolanceGraphAdapter(GraphDBInterface):
             return metrics
 
         return await asyncio.to_thread(read)
+
+    async def get_top_degree_node_ids(self, top_k: int) -> list[str]:
+        """Ids of up to ``top_k`` high-degree nodes, ranked over a bounded edge sample."""
+        if top_k < 1:
+            raise ValueError("top_k must be >= 1")
+        await self.initialize()
+        return await asyncio.to_thread(self._t_top_degree_node_ids, top_k)
+
+    async def get_entity_type_names(self, entity_ids: list[str]) -> dict[str, str]:
+        """The EntityType name each entity points to through one ``is_a`` edge."""
+        members = _unique(entity_ids)
+        if not members:
+            return {}
+        await self.initialize()
+        return await asyncio.to_thread(self._t_entity_type_names, members)
+
+    async def get_temporal_anchors(
+        self,
+        chunk_ids,
+        entity_ids,
+        start: int | None,
+        end: int | None,
+    ) -> dict[str, set[str]]:
+        """Candidates attached to a Timestamp overlapping ``[start, end)``: directly,
+        or (for chunks) through an entity they ``contains``. See the interface."""
+        chunks = [str(node_id) for node_id in chunk_ids]
+        entities = [str(node_id) for node_id in entity_ids]
+        await self.initialize()
+        return await asyncio.to_thread(self._t_temporal_anchors, chunks, entities, start, end)
+
+    async def get_triplets_batch(self, offset: int, limit: int) -> list[dict[str, Any]]:
+        """Triplets ``{start_node, relationship_properties, end_node}`` in Ladybug's order."""
+        if offset < 0:
+            raise ValueError(f"Offset must be non-negative, got {offset}")
+        if limit < 0:
+            raise ValueError(f"Limit must be non-negative, got {limit}")
+        await self.initialize()
+        return await asyncio.to_thread(self._t_triplets_page, offset, limit)
