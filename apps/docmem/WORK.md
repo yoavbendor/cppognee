@@ -34,7 +34,9 @@ Variables, all optional: `DOCMEM_VENV` (venv path), `DOCMEM_PYTHON` (default 3.1
 | `index` | `nanolance` from your package index (an Artifactory that carries it) | nothing else |
 | a path to a `.whl` file | that wheel, e.g. a version your index does not carry yet | nothing else |
 
-A wheel to test is built from a nanolance clone with `uv build --wheel bindings/python` (into `dist/`).
+A wheel to test is built from a nanolance clone with `uv build --python 3.12 --wheel bindings/python`
+(into `dist/`). Its Python must be the venv's (`DOCMEM_PYTHON`, default 3.12): uv refuses a cp313 wheel in
+a 3.12 venv as "incompatible with the current platform".
 
 ### On a corporate host: one egress policy for install and runtime
 
