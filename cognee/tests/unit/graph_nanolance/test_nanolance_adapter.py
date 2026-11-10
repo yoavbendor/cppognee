@@ -2,14 +2,15 @@
 dangling-edge skipping, index state, and methods that stay inherited for later stages."""
 
 import asyncio
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
 
 import cognee_nanograph
 from cognee.exceptions import CogneeValidationError
-from cognee.infrastructure.databases.exceptions import UnsupportedProvenanceCapability
 from cognee.infrastructure.databases.graph.supported_databases import supported_databases
+from cognee.infrastructure.databases.provenance import EdgeIdentity, make_source_ref_key
 from cognee_nanograph import NanolanceGraphAdapter
 
 
@@ -196,9 +197,28 @@ async def test_delete_graph_empties_both_tables(graph):
 
 
 @pytest.mark.asyncio
-async def test_provenance_and_edge_deletion_stay_inherited(graph):
-    """Methods for later stages are not stubbed: the interface default raises."""
-    with pytest.raises(UnsupportedProvenanceCapability):
-        await graph.attach_node_source_refs(["a"], ["ref"])
-    with pytest.raises(UnsupportedProvenanceCapability):
-        await graph.delete_edge_triples([])
+async def test_provenance_stamp_survives_plain_reupsert_and_learned_values(graph):
+    """A plain re-add keeps stored provenance and learned values; a fold adds its ref once."""
+    ref = make_source_ref_key(uuid4(), uuid4())
+    await graph.add_nodes([("a", {"name": "a", "type": "Node"})], source_ref_key=ref)
+    await graph.set_node_feedback_weights({"a": 0.8})
+    await graph.add_nodes([("a", {"name": "a", "type": "Node", "v": 2})])
+    node = (await graph.get_node_delete_data(["a"]))["a"]
+    assert node.source_ref_keys == [ref]
+    assert node.node_properties["feedback_weight"] == 0.8
+    assert node.node_properties["v"] == 2
+    await graph.add_nodes([("a", {"name": "a", "type": "Node"})], source_ref_key=ref)
+    assert (await graph.get_node_delete_data(["a"]))["a"].source_ref_keys == [ref]
+
+
+@pytest.mark.asyncio
+async def test_delete_edge_triples_keeps_endpoints(graph):
+    await graph.add_nodes(
+        [("a", {"name": "a", "type": "Node"}), ("b", {"name": "b", "type": "Node"})]
+    )
+    await graph.add_edges([("a", "b", "r", {}), ("a", "b", "s", {})])
+    await graph.delete_edge_triples([EdgeIdentity("a", "b", "r")])
+    assert await graph.has_edges([("a", "b", "r"), ("a", "b", "s")]) == [("a", "b", "s")]
+    assert {n["id"] for n in await graph.get_nodes(["a", "b"])} == {"a", "b"}
+    assert graph.supports_per_row_source_refs is True
+    assert graph.supports_incremental_chunk_updates is False

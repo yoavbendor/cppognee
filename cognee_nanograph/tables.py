@@ -8,6 +8,9 @@ import pyarrow as pa
 
 NODES_TABLE = "nodes"
 EDGES_TABLE = "edges"
+# Graph-level key/value metadata (Ladybug's GraphMetadata table). Holds the provenance
+# marker that tells cognee the graph stores its own source refs.
+METADATA_TABLE = "metadata"
 
 PROVENANCE_COLUMNS = ("source_ref_keys", "source_dataset_ids", "source_run_ids", "source_run_refs")
 
@@ -41,6 +44,8 @@ EDGE_SCHEMA = pa.schema(
         pa.field("edge_key", pa.string()),
     ]
 )
+
+METADATA_SCHEMA = pa.schema([pa.field("key", pa.string()), pa.field("value", pa.string())])
 
 # (column, index type) per table. BTREE for point and IN lookups, BITMAP for the
 # low-cardinality type / relationship columns.

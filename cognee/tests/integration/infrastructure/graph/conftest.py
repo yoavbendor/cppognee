@@ -89,12 +89,16 @@ async def _make_neo4j_adapter():
     return adapter
 
 
-@pytest_asyncio.fixture(params=["ladybug", "postgres", "neo4j"])
+@pytest_asyncio.fixture(params=["ladybug", "postgres", "neo4j", "nanolance"])
 async def graph_provenance_adapter(request, tmp_path):
     if request.param == "ladybug":
         if not HAS_LADYBUG:
             pytest.skip("ladybug not installed")
         adapter = LadybugAdapter(str(tmp_path / "graph_db"))
+    elif request.param == "nanolance":
+        nanolance = pytest.importorskip("cognee_nanograph")
+        adapter = nanolance.NanolanceGraphAdapter(graph_database_url=str(tmp_path / "graph"))
+        await adapter.initialize()
     elif request.param == "postgres":
         adapter = await _make_postgres_adapter()
     elif request.param == "neo4j":
