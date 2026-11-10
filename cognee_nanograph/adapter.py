@@ -1,9 +1,11 @@
 """Graph adapter that keeps cognee's graph in two nanolance (Lance-format) tables.
 
 ``GRAPH_DATABASE_URL`` is the directory holding ``nodes.lance`` and ``edges.lance``.
-Blocking Lance work runs in worker threads (``asyncio.to_thread``); writes are
-serialized per adapter by an asyncio lock, and every operation opens the tables at
-their current version, so several adapters on one directory see each other's writes.
+Blocking Lance work runs in worker threads (``asyncio.to_thread``). Writes are serialized
+per adapter by an asyncio lock and across processes by a file lock (``.write.lock`` in the
+graph directory); every write reads the tables after taking the file lock, and every
+operation opens the tables at their current version, so writers on one directory see each
+other's writes. Reads take no lock.
 """
 
 import asyncio
@@ -17,11 +19,14 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
+from filelock import FileLock
 from nanolance import lance
 
 from cognee.exceptions import CogneeValidationError
+from cognee.infrastructure.databases.graph.degree_seeds import EDGE_SAMPLE_ROWS
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
+    temporal_anchors_from_rows,
     timestamp_overlaps,
 )
 from cognee.infrastructure.databases.provenance import EdgeDeleteData, EdgeIdentity, NodeDeleteData
@@ -52,6 +57,8 @@ from .tables import (
 
 logger = get_logger()
 
+# Cross-process lock file inside the graph directory; held around every write.
+_WRITE_LOCK_FILE = ".write.lock"
 # IN lists are sent to the Lance filter parser in slices of this size.
 _IN_CHUNK = 500
 _NODE_READ = ("id", "name", "type", "properties")
@@ -359,13 +366,24 @@ class NanolanceGraphAdapter(GraphDBInterface):
             return
         async with self._write_lock:
             if not self._initialized:
-                await asyncio.to_thread(self._t_create_tables)
+                await asyncio.to_thread(self._t_locked, self._t_create_tables)
                 self._initialized = True
 
     async def _write(self, operation, *args):
         """Run a blocking write under the adapter's write lock and return its result."""
         async with self._write_lock:
-            return await asyncio.to_thread(operation, *args)
+            return await asyncio.to_thread(self._t_locked, operation, *args)
+
+    def _t_locked(self, operation, *args):
+        """Run ``operation`` while holding the graph directory's cross-process file lock.
+
+        Runs in a worker thread so the event loop never waits on the lock. The lock is taken
+        before any table is read, and every read opens the newest table version, so the
+        read-modify-write inside ``operation`` sees writes made by other processes.
+        """
+        os.makedirs(self.database_path, exist_ok=True)
+        with FileLock(os.path.join(self.database_path, _WRITE_LOCK_FILE)):
+            return operation(*args)
 
     # ------------------------------------------------------------------ writes (threads)
 
@@ -549,6 +567,72 @@ class NanolanceGraphAdapter(GraphDBInterface):
         )
         return returned
 
+    def _t_set_node_truth(self, states: dict[str, dict[str, Any]]) -> set[str]:
+        """Write truth_alignment, and truth_epoch when given, into the stored node blobs."""
+        rows = self._t_full_rows(NODES_TABLE, "id", list(states), NODE_SCHEMA)
+
+        def change(row: dict) -> dict | None:
+            state = states[row["id"]]
+            properties = _props_blob(row["properties"])
+            properties["truth_alignment"] = list(state.get("truth_alignment") or [])
+            if state.get("truth_epoch") is not None:
+                properties["truth_epoch"] = int(state["truth_epoch"])
+            return {"properties": json.dumps(properties, cls=JSONEncoder)}
+
+        changed = self._t_apply_changes(
+            NODES_TABLE,
+            "id",
+            NODE_SCHEMA,
+            NODE_INDEXES,
+            rows,
+            change,
+            touch_updated_at=True,
+        )
+        return {row["id"] for row in changed}
+
+    def _t_update_node(self, node_id: str, values: dict[str, Any]) -> bool:
+        """Merge ``values`` into one stored node blob; the native columns are not touched."""
+        rows = self._t_full_rows(NODES_TABLE, "id", [node_id], NODE_SCHEMA)
+
+        def change(row: dict) -> dict:
+            properties = {**_props_blob(row["properties"]), **values}
+            return {"properties": json.dumps(properties, cls=JSONEncoder)}
+
+        changed = self._t_apply_changes(
+            NODES_TABLE,
+            "id",
+            NODE_SCHEMA,
+            NODE_INDEXES,
+            rows,
+            change,
+            touch_updated_at=False,
+        )
+        return bool(changed)
+
+    def _t_update_chunk_index(self, chunk_indexes: dict[str, int]) -> None:
+        """Set chunk_index in the stored node blobs. Rows whose blob is not a JSON object are skipped."""
+        rows = self._t_full_rows(NODES_TABLE, "id", list(chunk_indexes), NODE_SCHEMA)
+
+        def change(row: dict) -> dict | None:
+            try:
+                properties = json.loads(row["properties"] or "")
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(properties, dict):
+                return None
+            properties["chunk_index"] = chunk_indexes[row["id"]]
+            return {"properties": json.dumps(properties, cls=JSONEncoder)}
+
+        self._t_apply_changes(
+            NODES_TABLE,
+            "id",
+            NODE_SCHEMA,
+            NODE_INDEXES,
+            rows,
+            change,
+            touch_updated_at=False,
+        )
+
     def _t_set_graph_metadata(self, metadata: dict[str, str]) -> None:
         rows = [{"key": key, "value": value} for key, value in metadata.items()]
         table = pa.Table.from_pylist(rows, schema=METADATA_SCHEMA)
@@ -584,6 +668,128 @@ class NanolanceGraphAdapter(GraphDBInterface):
                 }
             )
         return sorted(result, key=lambda item: (item["time_at"], item["id"]))
+
+    def _t_overlapping_timestamps(self, node_ids: list[str], start, end) -> set[str]:
+        """The ids among ``node_ids`` that are Timestamp rows overlapping ``[start, end)``."""
+        rows = self._t_rows_where(NODES_TABLE, "id", node_ids, ("id", "properties"))
+        return {
+            row["id"]
+            for row in rows
+            if timestamp_overlaps({**_props_blob(row["properties"]), "id": row["id"]}, start, end)
+        }
+
+    def _t_edge_triples(self, node_ids: Iterable[str], edge_types: list[str] | None) -> list:
+        """``(source, target, relationship)`` of every edge touching ``node_ids``."""
+        table = self._t_edges_touching(node_ids, edge_types)
+        return list(
+            zip(
+                table["source_id"].to_pylist(),
+                table["target_id"].to_pylist(),
+                table["relationship_name"].to_pylist(),
+            )
+        )
+
+    def _t_entity_type_names(self, entity_ids: list[str]) -> dict[str, str]:
+        members = set(entity_ids)
+        is_a = [(s, t) for s, t, _ in self._t_edge_triples(entity_ids, ["is_a"]) if s in members]
+        names = {
+            row["id"]: row["name"]
+            for row in self._t_rows_where(
+                NODES_TABLE, "id", _unique(t for _, t in is_a), ("id", "name", "type")
+            )
+            if row["type"] == "EntityType" and row["name"]
+        }
+        return {s: names[t] for s, t in is_a if t in names}
+
+    def _t_top_degree_node_ids(self, top_k: int) -> list[str]:
+        """Degree ranking over the first ``EDGE_SAMPLE_ROWS`` edges, then nodes to fill up.
+
+        The same bounded sample Ladybug ranks (``cypher_degree_seeds``): ties go to the
+        smaller id, and the fill takes any nodes not already ranked.
+        """
+        sample = self._open(EDGES_TABLE).head(EDGE_SAMPLE_ROWS, columns=["source_id", "target_id"])
+        ends = pa.concat_arrays(
+            [sample["source_id"].combine_chunks(), sample["target_id"].combine_chunks()]
+        )
+        counts = pc.value_counts(pc.drop_null(ends))
+        ranked = pa.table({"id": counts.field("values"), "degree": counts.field("counts")}).sort_by(
+            [("degree", "descending"), ("id", "ascending")]
+        )
+        seeds = ranked["id"].slice(0, top_k).to_pylist()
+        if len(seeds) < top_k:
+            # Any top_k nodes hold at most len(seeds) ranked ids, so this leaves enough.
+            ids = self._open(NODES_TABLE).to_table(columns=["id"], limit=top_k)["id"].to_pylist()
+            ranked_ids = set(seeds)
+            fill = [i for i in ids if i not in ranked_ids]
+            seeds.extend(fill[: top_k - len(seeds)])
+        return seeds
+
+    def _t_temporal_anchors(
+        self, chunk_ids: list[str], entity_ids: list[str], start, end
+    ) -> dict[str, set[str]]:
+        chunks = _unique(chunk_ids)
+        candidates = set(_unique([*chunks, *entity_ids]))
+        if not candidates:
+            return temporal_anchors_from_rows([], [], [])
+        chunk_set = set(chunks)
+        hops = [(s, t, r) for s, t, r in self._t_edge_triples(candidates, None) if s in candidates]
+        contains = {(s, t) for s, t, r in hops if s in chunk_set and r == "contains"}
+        reached = _unique(entity for _, entity in contains)
+        reached_set = set(reached)
+        onward = [(s, t) for s, t, _ in self._t_edge_triples(reached, None) if s in reached_set]
+        targets = _unique([t for _, t, _ in hops] + [t for _, t in onward])
+        types = {
+            row["id"]: row["type"]
+            for row in self._t_rows_where(NODES_TABLE, "id", targets, ("id", "type"))
+        }
+        in_window = self._t_overlapping_timestamps(
+            [t for t in targets if types.get(t) == "Timestamp"], start, end
+        )
+        direct_rows = [(s, t) for s, t, _ in hops if t in in_window]
+        stamps_by_entity: dict[str, set[str]] = defaultdict(set)
+        for entity, stamp in onward:
+            if stamp in in_window:
+                stamps_by_entity[entity].add(stamp)
+        via_rows = [
+            (chunk, entity, stamp)
+            for chunk, entity in contains
+            if types.get(entity) == "Entity"
+            for stamp in stamps_by_entity.get(entity, ())
+        ]
+        return temporal_anchors_from_rows(direct_rows, via_rows, chunks)
+
+    def _t_triplets_page(self, offset: int, limit: int) -> list[dict[str, Any]]:
+        """One page of edges ordered by (source id, target id, relationship), with their nodes.
+
+        Only the three key columns are read for the ordering; the page's rows are then taken
+        whole. Ladybug's ORDER BY ranks the same way, so offsets name the same triplets.
+        """
+        ds = self._open(EDGES_TABLE)
+        keys = ds.to_table(columns=["source_id", "target_id", "relationship_name"])
+        order = pc.sort_indices(
+            keys,
+            sort_keys=[
+                ("source_id", "ascending"),
+                ("target_id", "ascending"),
+                ("relationship_name", "ascending"),
+            ],
+        )
+        positions = order[offset : offset + limit].to_pylist()
+        if not positions:
+            return []
+        edges = self._edge_tuples(ds.take(positions, columns=list(_EDGE_READ)))
+        node_ids = _unique(part for source, target, _, _ in edges for part in (source, target))
+        nodes = {node["id"]: node for node in self._node_dicts(self._t_nodes_by_ids(node_ids))}
+        return [
+            {
+                "start_node": nodes[source],
+                "relationship_properties": {**props, "relationship_name": relationship},
+                "end_node": nodes[target],
+            }
+            for source, target, relationship, props in edges
+            # An endpoint that is not in the nodes table drops the triplet, as in Ladybug's MATCH.
+            if source in nodes and target in nodes
+        ]
 
     def _t_ids_with_member(self, table: str, column: str, value: str, columns) -> list[dict]:
         """Rows whose list column ``column`` contains ``value`` (pushed down to Lance)."""
@@ -1093,6 +1299,50 @@ class NanolanceGraphAdapter(GraphDBInterface):
             updated = await self._write(self._t_set_edge_feedback, valid)
         return {eid: (eid in updated) for eid in edge_feedback_weights}
 
+    async def get_node_truth_state(self, node_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Truth state of the found nodes; ``truth_epoch`` is None when unset or not an int."""
+        valid = [n for n in node_ids if isinstance(n, str) and n]
+        if not valid:
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        for node in await self.get_nodes(valid):
+            alignment = node.get("truth_alignment", [])
+            try:
+                epoch = int(node["truth_epoch"]) if node.get("truth_epoch") is not None else None
+            except (TypeError, ValueError):
+                epoch = None
+            result[node["id"]] = {
+                "truth_alignment": list(alignment) if isinstance(alignment, (list, tuple)) else [],
+                "truth_epoch": epoch,
+            }
+        return result
+
+    async def set_node_truth_state(
+        self, node_truth_state: dict[str, dict[str, Any]]
+    ) -> dict[str, bool]:
+        if not node_truth_state:
+            return {}
+        valid = {n: s for n, s in node_truth_state.items() if isinstance(n, str) and n}
+        updated: set[str] = set()
+        if valid:
+            await self.initialize()
+            updated = await self._write(self._t_set_node_truth, valid)
+        return {nid: (nid in updated) for nid in node_truth_state}
+
+    async def update_node(self, node_id: str, values: dict[str, Any]) -> bool:
+        """Merge ``values`` into the node's properties. False for a missing node or no values."""
+        if not isinstance(node_id, str) or not node_id or not values:
+            return False
+        await self.initialize()
+        return await self._write(self._t_update_node, node_id, values)
+
+    async def update_chunk_index(self, chunk_indexes: dict[str, int]) -> None:
+        """Set ``chunk_index`` on the given nodes; every other property is carried over."""
+        if not chunk_indexes:
+            return
+        await self.initialize()
+        await self._write(self._t_update_chunk_index, chunk_indexes)
+
     async def get_timestamps_in_range(self, start: int | None, end: int | None) -> list[dict]:
         """Timestamp nodes whose ``[time_at, time_until)`` overlaps ``[start, end)``.
 
@@ -1363,3 +1613,41 @@ class NanolanceGraphAdapter(GraphDBInterface):
             return metrics
 
         return await asyncio.to_thread(read)
+
+    async def get_top_degree_node_ids(self, top_k: int) -> list[str]:
+        """Ids of up to ``top_k`` high-degree nodes, ranked over a bounded edge sample."""
+        if top_k < 1:
+            raise ValueError("top_k must be >= 1")
+        await self.initialize()
+        return await asyncio.to_thread(self._t_top_degree_node_ids, top_k)
+
+    async def get_entity_type_names(self, entity_ids: list[str]) -> dict[str, str]:
+        """The EntityType name each entity points to through one ``is_a`` edge."""
+        members = _unique(entity_ids)
+        if not members:
+            return {}
+        await self.initialize()
+        return await asyncio.to_thread(self._t_entity_type_names, members)
+
+    async def get_temporal_anchors(
+        self,
+        chunk_ids,
+        entity_ids,
+        start: int | None,
+        end: int | None,
+    ) -> dict[str, set[str]]:
+        """Candidates attached to a Timestamp overlapping ``[start, end)``: directly,
+        or (for chunks) through an entity they ``contains``. See the interface."""
+        chunks = [str(node_id) for node_id in chunk_ids]
+        entities = [str(node_id) for node_id in entity_ids]
+        await self.initialize()
+        return await asyncio.to_thread(self._t_temporal_anchors, chunks, entities, start, end)
+
+    async def get_triplets_batch(self, offset: int, limit: int) -> list[dict[str, Any]]:
+        """Triplets ``{start_node, relationship_properties, end_node}`` in Ladybug's order."""
+        if offset < 0:
+            raise ValueError(f"Offset must be non-negative, got {offset}")
+        if limit < 0:
+            raise ValueError(f"Limit must be non-negative, got {limit}")
+        await self.initialize()
+        return await asyncio.to_thread(self._t_triplets_page, offset, limit)
