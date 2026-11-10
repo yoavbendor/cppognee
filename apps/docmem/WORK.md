@@ -24,9 +24,17 @@ bash apps/docmem/tools/work/setup.sh
 
 This creates `apps/docmem/.venv` with cognee (this repository), nanolance (built from
 `yoavbendor/nanolance@main`) and docmem, installs Ladybug's JSON extension, then checks the three import.
-Variables, all optional: `DOCMEM_VENV` (venv path), `DOCMEM_PYTHON` (default 3.12), `NANOLANCE_GIT_URL`
-(default the GitHub repository; set your internal mirror's URL), `NANOLANCE_REF` (default `main`),
-`LADYBUG_EXTENSION_REPO` (default `https://extension.ladybugdb.com/`).
+Variables, all optional: `DOCMEM_VENV` (venv path), `DOCMEM_PYTHON` (default 3.12),
+`LADYBUG_EXTENSION_REPO` (default `https://extension.ladybugdb.com/`), and where nanolance comes from,
+`NANOLANCE_INSTALL`:
+
+| `NANOLANCE_INSTALL` | nanolance is | needs |
+|---|---|---|
+| `git` (default) | built from `NANOLANCE_GIT_URL` (default the GitHub repository; set your mirror's URL) at `NANOLANCE_REF` (default `main`) | a C++17 compiler, the git repository |
+| `index` | `nanolance` from your package index (an Artifactory that carries it) | nothing else |
+| a path to a `.whl` file | that wheel, e.g. a version your index does not carry yet | nothing else |
+
+A wheel to test is built from a nanolance clone with `uv build --wheel bindings/python` (into `dist/`).
 
 ### On a corporate host: one egress policy for install and runtime
 
@@ -36,11 +44,13 @@ during setup and at runtime), and export it before setup and before every run:
 
 ```sh
 export COGNEE_EGRESS_POLICY=$HOME/cognee-egress.json
-NANOLANCE_GIT_URL=https://<your-gitlab>/<group>/nanolance bash apps/docmem/tools/work/setup.sh
+NANOLANCE_INSTALL=index bash apps/docmem/tools/work/setup.sh       # nanolance from your Artifactory
+# or a wheel your Artifactory does not have yet:  NANOLANCE_INSTALL=/path/to/nanolance-*.whl bash ...
+# or build it:  NANOLANCE_GIT_URL=https://<your-gitlab>/<group>/nanolance bash ...
 apps/docmem/.venv/bin/python -m cognee_egress.isolate -- bash apps/docmem/tools/work/run_eval.sh
 ```
 
-nanolance's C++ build clones five dependencies. Point them at your mirrors too, either all under one
+When nanolance is built from source (`NANOLANCE_INSTALL=git`), its C++ build clones five dependencies. Point them at your mirrors too, either all under one
 group with `NANOLANCE_GIT_BASE=https://<your-gitlab>/<group>` (each is then `<group>/<owner>/<repo>.git`),
 or one by one: `NANOLANCE_GIT_URL_NANOARROW` (apache/arrow-nanoarrow), `NANOLANCE_GIT_URL_ZSTD`
 (facebook/zstd), `NANOLANCE_GIT_URL_CLI11` (CLIUtils/CLI11), `NANOLANCE_GIT_URL_NANOM` (yoavbendor/nanom),
