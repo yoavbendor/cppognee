@@ -5,6 +5,8 @@ from typing import Any
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from cognee.infrastructure.llm.egress_check import check_provider_endpoint
+
 try:
     from baml_py import ClientRegistry  # ty:ignore[unresolved-import]
 except ImportError:
@@ -320,6 +322,7 @@ class LLMConfig(BaseSettings):
                 "Please install with 'pip install cognee\"[baml]\"' to use BAML extraction features."
             )
         elif self.structured_output_framework.lower() == "baml" and ClientRegistry is not None:
+            check_provider_endpoint(self.baml_llm_provider, self.baml_llm_endpoint or None, "llm")
             self.baml_registry = ClientRegistry()
 
             raw_options = {

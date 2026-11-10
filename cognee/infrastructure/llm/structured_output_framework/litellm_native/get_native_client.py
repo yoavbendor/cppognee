@@ -14,6 +14,7 @@ from cognee.infrastructure.llm.azure_identity import (
     require_azure_endpoint,
 )
 from cognee.infrastructure.llm.config import get_llm_context_config
+from cognee.infrastructure.llm.egress_check import check_provider_endpoint
 from cognee.infrastructure.llm.exceptions import LLMAPIKeyNotSetError
 from cognee.infrastructure.llm.structured_output_framework.litellm_native.native_adapter import (
     NativeLiteLLMAdapter,
@@ -105,6 +106,7 @@ def get_native_client(raise_api_key_error: bool = True) -> NativeLiteLLMAdapter:
     user_max = llm_config.llm_max_completion_tokens
     max_completion_tokens = min(model_max, user_max) if model_max is not None else user_max
 
+    check_provider_endpoint(provider, llm_config.llm_endpoint or None, "llm")
     return NativeLiteLLMAdapter(
         # Under managed identity the token is the credential; no key goes alongside it.
         api_key=None if use_managed_identity else api_key or "",

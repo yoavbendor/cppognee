@@ -9,6 +9,7 @@ from cognee.infrastructure.databases.vector.embeddings.config import (
 from cognee.infrastructure.llm.config import (
     get_llm_context_config,
 )
+from cognee.infrastructure.llm.egress_check import check_provider_endpoint
 from cognee.shared.logging_utils import get_logger
 
 from .EmbeddingEngine import EmbeddingEngine
@@ -111,6 +112,7 @@ def create_embedding_engine(
 
         Returns an instance of an embedding engine based on the specified provider.
     """
+    check_provider_endpoint(embedding_provider, embedding_endpoint, "embedding")
     embedding_encoding_format = validate_encoding_format(embedding_encoding_format)
     if embedding_encoding_format == "base64" and not base64_supported(embedding_provider):
         raise CogneeConfigurationError(
