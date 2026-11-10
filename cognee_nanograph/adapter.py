@@ -22,6 +22,7 @@ import pyarrow.compute as pc
 from filelock import FileLock
 from nanolance import lance
 
+from cognee.base_config import get_base_config
 from cognee.exceptions import CogneeValidationError
 from cognee.infrastructure.databases.graph.degree_seeds import EDGE_SAMPLE_ROWS
 from cognee.infrastructure.databases.graph.graph_db_interface import (
@@ -205,16 +206,16 @@ class NanolanceGraphAdapter(GraphDBInterface):
         graph_database_key: str = "",
         database_name: str = "",
     ) -> None:
-        """Bind to the graph directory in ``graph_database_url``.
+        """Bind to the graph directory in ``graph_database_url`` (default: under the system root).
 
         ``create_graph_engine`` passes the connection fields to every adapter registered
         in ``supported_databases``. Username, password, port and database name are
         accepted and ignored (a local directory has none); a remote key is refused.
         """
         if not graph_database_url:
-            raise OSError(
-                "Missing nanolance graph directory: set GRAPH_DATABASE_URL to an absolute "
-                "directory path."
+            # Same default location as Ladybug's graph file: <system root>/databases/<name>.
+            graph_database_url = os.path.join(
+                get_base_config().system_root_directory, "databases", "cognee_graph_nanolance"
             )
         if graph_database_key:
             raise OSError(

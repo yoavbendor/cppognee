@@ -88,6 +88,12 @@ class GraphConfig(BaseSettings):
             self.graph_dataset_database_handler = "neo4j"
         if provider == "turso" and graph_dataset_database_handler in ("ladybug", "turso"):
             self.graph_dataset_database_handler = "turso_graph"
+        # Any other provider left on the default handler uses the handler named after it
+        # (external adapters such as nanolance). The name is not looked up in the registry
+        # here: the config can be cached before an adapter registers, and
+        # multi_user_support_possible() validates the name when it is used.
+        if self.graph_dataset_database_handler == "ladybug" and provider not in ("ladybug", "kuzu"):
+            self.graph_dataset_database_handler = provider
         base_config = get_base_config()
 
         databases_directory_path = os.path.join(base_config.system_root_directory, "databases")
