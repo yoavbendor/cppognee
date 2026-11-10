@@ -23,8 +23,26 @@ bash apps/docmem/tools/work/setup.sh
 ```
 
 This creates `apps/docmem/.venv` with cognee (this repository), nanolance (built from
-`yoavbendor/nanolance@main`) and docmem, then checks the three import. Variables, all optional:
-`DOCMEM_VENV` (venv path), `DOCMEM_PYTHON` (default 3.12), `NANOLANCE_REF` (default `main`).
+`yoavbendor/nanolance@main`) and docmem, installs Ladybug's JSON extension, then checks the three import.
+Variables, all optional: `DOCMEM_VENV` (venv path), `DOCMEM_PYTHON` (default 3.12), `NANOLANCE_GIT_URL`
+(default the GitHub repository; set your internal mirror's URL), `NANOLANCE_REF` (default `main`),
+`LADYBUG_EXTENSION_REPO` (default `https://extension.ladybugdb.com/`).
+
+### On a corporate host: one egress policy for install and runtime
+
+Copy `docs/egress.example.json` (repository root), put your internal hosts in it (package mirror, git
+mirror, LLM, decider), and export it before setup and before every run:
+
+```sh
+export COGNEE_EGRESS_POLICY=$HOME/cognee-egress.json
+NANOLANCE_GIT_URL=https://<your-gitlab>/<group>/nanolance bash apps/docmem/tools/work/setup.sh
+apps/docmem/.venv/bin/python -m cognee_egress.isolate -- bash apps/docmem/tools/work/run_eval.sh
+```
+
+Setup then runs in a network namespace that can reach only the policy's `install` hosts; the evaluation
+runs where only the `runtime` hosts are reachable, so the decider host must be listed there with role
+`decider`. Without user namespaces (`unshare -rn true` fails), skip the `isolate` wrapper: the policy
+still applies inside Python. Details and limits: `docs/egress.md`.
 
 ## 2. Point it at Decision-1
 

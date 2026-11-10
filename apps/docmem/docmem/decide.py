@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+import cognee_egress
+
 FLAVORS = ("foundry", "kev")
 AUTHS = ("key", "entra")
 QUESTION_TYPES = ("noul", "choice", "score")
@@ -261,6 +263,7 @@ def _read_cache(path: Path) -> dict:
 class Decider:
     def __init__(self, cfg: Config, cache: Path | None = None, max_questions: int = 16, timeout: float = 120,
                  sleep=time.sleep):
+        cognee_egress.check_url(cfg.endpoint, role="decider", method="POST")  # no-op without a policy
         self.cfg = cfg
         self.cache_path = cache
         self.max_questions = max_questions

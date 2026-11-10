@@ -15,6 +15,12 @@ Common entrypoints include:
 """
 
 # ruff: noqa: E402
+# Egress guard first, before any third-party import can open a connection (no-op unless
+# COGNEE_EGRESS_POLICY is set). See docs/egress.md.
+import cognee_egress
+
+cognee_egress.install_from_env()
+
 from cognee.version import get_cognee_version
 
 # NOTE: __version__ extraction must be at the top of the __init__.py otherwise
@@ -27,6 +33,8 @@ __version__ = get_cognee_version()
 from cognee.shared.env_file import load_env_file, describe_resolution
 
 _env_file = load_env_file()
+# A .env may name the policy; it may not replace or remove one already installed.
+cognee_egress.install_from_env()
 
 # NOTE: Log level can be set with the LOG_LEVEL env variable
 from cognee.shared.logging_utils import setup_logging

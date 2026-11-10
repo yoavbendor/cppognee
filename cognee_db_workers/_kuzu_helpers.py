@@ -22,6 +22,8 @@ import sys
 import tempfile
 from collections.abc import Callable
 
+import cognee_egress
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,6 +64,16 @@ _BUNDLED_EXTENSIONS_DIR = os.path.join(os.path.dirname(__file__), "ladybug_exten
 _PROBE_REPO = "/cognee-nonexistent-extension-repo/"
 
 _EXTENSION_RELPATH_PATTERN = re.compile(r"(v[\d.]+)[/\\]([A-Za-z0-9_]+)[/\\]json[/\\]libjson")
+
+# Ladybug's native code downloads extensions from this repo on INSTALL. The Python egress guard
+# cannot see those requests, so every remote INSTALL is checked here against the policy.
+LADYBUG_EXTENSION_REPO = "http://extension.ladybugdb.com/"
+
+
+def check_remote_extension_install() -> None:
+    """Raise cognee_egress.EgressDenied unless the egress policy (if any) allows Ladybug's remote
+    extension repository. No policy installed: allowed (upstream behaviour)."""
+    cognee_egress.check_url(LADYBUG_EXTENSION_REPO, role=None)
 
 
 def _requested_extension_relpath(
@@ -148,6 +160,13 @@ def load_json_extension(execute: Callable[[str], object]) -> None:
                 exc_info=True,
             )
 
+    try:
+        check_remote_extension_install()
+    except cognee_egress.EgressDenied as error:
+        raise cognee_egress.EgressDenied(
+            f"{error} The JSON extension is not installed locally: install it during setup "
+            "(outside the runtime policy) or list extension.ladybugdb.com in the policy."
+        ) from error
     execute("INSTALL JSON;")
     execute("LOAD EXTENSION JSON;")
 
@@ -170,6 +189,11 @@ def install_json_extension_local(
     pattern as
     ``cognee/infrastructure/databases/graph/ladybug/ladybug_migrate.py``.
     """
+    try:
+        check_remote_extension_install()
+    except cognee_egress.EgressDenied:
+        return
+
     import ladybug
 
     # Bundled binaries make the warm-up pointless: LOAD by absolute path

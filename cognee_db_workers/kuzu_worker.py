@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import logging
 
-from ._kuzu_helpers import install_json_extension_local, load_json_extension
+from ._kuzu_helpers import (
+    check_remote_extension_install,
+    install_json_extension_local,
+    load_json_extension,
+)
 from .harness import (
     DEFAULT_DISPATCH,
     HandleRegistry,
@@ -198,6 +202,7 @@ def _load_extension(registry: HandleRegistry, req: Request) -> None:
         # can fail silently (e.g. a transient network error downloading the
         # extension on a fresh machine). Install on the live connection and
         # retry once; if INSTALL fails here it raises with the real cause.
+        check_remote_extension_install()
         conn.execute(f"INSTALL {extension_name};")
         conn.execute(f"LOAD EXTENSION {extension_name};")
 

@@ -5,7 +5,12 @@ This package must stay free of cognee imports so that a spawned worker has
 a small memory footprint (just the native DB library + stdlib).
 """
 
-from ._windows_openssl import ensure_ladybug_openssl
+import cognee_egress
+
+# Spawned workers load this package without cognee: install the parent's egress policy here too.
+cognee_egress.install_from_env()
+
+from ._windows_openssl import ensure_ladybug_openssl  # noqa: E402
 
 # Runs before anything in this package imports ``ladybug``, in the parent
 # process and in every spawned worker alike: ``multiprocessing`` spawn

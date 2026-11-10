@@ -4,6 +4,8 @@ import json
 import os
 import re
 
+import cognee_egress
+
 
 class Chat:
     def __init__(self, api_base=None, api_key=None, model=None):
@@ -13,6 +15,7 @@ class Chat:
         self.model = model or os.environ.get("DOCMEM_MODEL")
         if not self.api_base or not self.model:
             raise SystemExit("docmem: answering needs --api-base and --model (or DOCMEM_API_BASE, DOCMEM_MODEL)")
+        cognee_egress.check_url(self.api_base, role="llm", method="POST")  # no-op without a policy
         self.client = OpenAI(base_url=self.api_base, api_key=api_key or os.environ.get("DOCMEM_API_KEY") or "none")
         self.usage = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
 
