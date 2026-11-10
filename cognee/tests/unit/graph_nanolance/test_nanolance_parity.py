@@ -252,6 +252,43 @@ async def scenario_metadata_and_provenance_marker(g) -> dict:
     return out
 
 
+async def scenario_truth_state(g) -> dict:
+    await g.add_nodes([_node("n1", props={"kept": "yes"}), _node("n2")])
+    out = {
+        "set": await g.set_node_truth_state(
+            {"n1": {"truth_alignment": ["a", "b"], "truth_epoch": 2}, "ghost": {}}
+        ),
+        "get": await g.get_node_truth_state(["n1", "n2", "ghost"]),
+    }
+    # An omitted epoch keeps the stored one; an empty alignment list clears the alignment.
+    out["set_partial"] = await g.set_node_truth_state({"n1": {"truth_alignment": []}})
+    out["get_partial"] = await g.get_node_truth_state(["n1"])
+    out["kept"] = (await g.get_node("n1"))["kept"]
+    return out
+
+
+async def scenario_update_node(g) -> dict:
+    await g.add_nodes([_node("n1", props={"keep": 1, "drop": 2})])
+    out = {
+        "update": await g.update_node("n1", {"drop": 5, "added": "x"}),
+        "missing": await g.update_node("ghost", {"x": 1}),
+        "empty": await g.update_node("n1", {}),
+    }
+    out["node"] = await g.get_node("n1")
+    return out
+
+
+async def scenario_update_chunk_index(g) -> dict:
+    await g.add_nodes(
+        [
+            _node("c1", "c1", "DocumentChunk", {"chunk_index": 0, "text": "t"}),
+            _node("c2", "c2", "DocumentChunk", {"chunk_index": 1, "text": "u"}),
+        ]
+    )
+    await g.update_chunk_index({"c2": 4, "ghost": 9})
+    return {"nodes": await g.get_nodes(["c1", "c2", "ghost"])}
+
+
 SCENARIOS = [
     scenario_attach_find_remove,
     scenario_fold_stamps_on_write,
@@ -261,6 +298,9 @@ SCENARIOS = [
     scenario_feedback_weights,
     scenario_timestamps_in_range,
     scenario_metadata_and_provenance_marker,
+    scenario_truth_state,
+    scenario_update_node,
+    scenario_update_chunk_index,
 ]
 
 

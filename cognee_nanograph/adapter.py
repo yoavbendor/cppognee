@@ -549,6 +549,72 @@ class NanolanceGraphAdapter(GraphDBInterface):
         )
         return returned
 
+    def _t_set_node_truth(self, states: dict[str, dict[str, Any]]) -> set[str]:
+        """Write truth_alignment, and truth_epoch when given, into the stored node blobs."""
+        rows = self._t_full_rows(NODES_TABLE, "id", list(states), NODE_SCHEMA)
+
+        def change(row: dict) -> dict | None:
+            state = states[row["id"]]
+            properties = _props_blob(row["properties"])
+            properties["truth_alignment"] = list(state.get("truth_alignment") or [])
+            if state.get("truth_epoch") is not None:
+                properties["truth_epoch"] = int(state["truth_epoch"])
+            return {"properties": json.dumps(properties, cls=JSONEncoder)}
+
+        changed = self._t_apply_changes(
+            NODES_TABLE,
+            "id",
+            NODE_SCHEMA,
+            NODE_INDEXES,
+            rows,
+            change,
+            touch_updated_at=True,
+        )
+        return {row["id"] for row in changed}
+
+    def _t_update_node(self, node_id: str, values: dict[str, Any]) -> bool:
+        """Merge ``values`` into one stored node blob; the native columns are not touched."""
+        rows = self._t_full_rows(NODES_TABLE, "id", [node_id], NODE_SCHEMA)
+
+        def change(row: dict) -> dict:
+            properties = {**_props_blob(row["properties"]), **values}
+            return {"properties": json.dumps(properties, cls=JSONEncoder)}
+
+        changed = self._t_apply_changes(
+            NODES_TABLE,
+            "id",
+            NODE_SCHEMA,
+            NODE_INDEXES,
+            rows,
+            change,
+            touch_updated_at=False,
+        )
+        return bool(changed)
+
+    def _t_update_chunk_index(self, chunk_indexes: dict[str, int]) -> None:
+        """Set chunk_index in the stored node blobs. Rows whose blob is not a JSON object are skipped."""
+        rows = self._t_full_rows(NODES_TABLE, "id", list(chunk_indexes), NODE_SCHEMA)
+
+        def change(row: dict) -> dict | None:
+            try:
+                properties = json.loads(row["properties"] or "")
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(properties, dict):
+                return None
+            properties["chunk_index"] = chunk_indexes[row["id"]]
+            return {"properties": json.dumps(properties, cls=JSONEncoder)}
+
+        self._t_apply_changes(
+            NODES_TABLE,
+            "id",
+            NODE_SCHEMA,
+            NODE_INDEXES,
+            rows,
+            change,
+            touch_updated_at=False,
+        )
+
     def _t_set_graph_metadata(self, metadata: dict[str, str]) -> None:
         rows = [{"key": key, "value": value} for key, value in metadata.items()]
         table = pa.Table.from_pylist(rows, schema=METADATA_SCHEMA)
@@ -1092,6 +1158,50 @@ class NanolanceGraphAdapter(GraphDBInterface):
             await self.initialize()
             updated = await self._write(self._t_set_edge_feedback, valid)
         return {eid: (eid in updated) for eid in edge_feedback_weights}
+
+    async def get_node_truth_state(self, node_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Truth state of the found nodes; ``truth_epoch`` is None when unset or not an int."""
+        valid = [n for n in node_ids if isinstance(n, str) and n]
+        if not valid:
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        for node in await self.get_nodes(valid):
+            alignment = node.get("truth_alignment", [])
+            try:
+                epoch = int(node["truth_epoch"]) if node.get("truth_epoch") is not None else None
+            except (TypeError, ValueError):
+                epoch = None
+            result[node["id"]] = {
+                "truth_alignment": list(alignment) if isinstance(alignment, (list, tuple)) else [],
+                "truth_epoch": epoch,
+            }
+        return result
+
+    async def set_node_truth_state(
+        self, node_truth_state: dict[str, dict[str, Any]]
+    ) -> dict[str, bool]:
+        if not node_truth_state:
+            return {}
+        valid = {n: s for n, s in node_truth_state.items() if isinstance(n, str) and n}
+        updated: set[str] = set()
+        if valid:
+            await self.initialize()
+            updated = await self._write(self._t_set_node_truth, valid)
+        return {nid: (nid in updated) for nid in node_truth_state}
+
+    async def update_node(self, node_id: str, values: dict[str, Any]) -> bool:
+        """Merge ``values`` into the node's properties. False for a missing node or no values."""
+        if not isinstance(node_id, str) or not node_id or not values:
+            return False
+        await self.initialize()
+        return await self._write(self._t_update_node, node_id, values)
+
+    async def update_chunk_index(self, chunk_indexes: dict[str, int]) -> None:
+        """Set ``chunk_index`` on the given nodes; every other property is carried over."""
+        if not chunk_indexes:
+            return
+        await self.initialize()
+        await self._write(self._t_update_chunk_index, chunk_indexes)
 
     async def get_timestamps_in_range(self, start: int | None, end: int | None) -> list[dict]:
         """Timestamp nodes whose ``[time_at, time_until)`` overlaps ``[start, end)``.

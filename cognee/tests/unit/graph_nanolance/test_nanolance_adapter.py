@@ -222,3 +222,85 @@ async def test_delete_edge_triples_keeps_endpoints(graph):
     assert {n["id"] for n in await graph.get_nodes(["a", "b"])} == {"a", "b"}
     assert graph.supports_per_row_source_refs is True
     assert graph.supports_incremental_chunk_updates is False
+
+
+@pytest.mark.asyncio
+async def test_truth_state_round_trip_keeps_epoch_when_unset(graph):
+    await graph.add_nodes(
+        [
+            ("a", {"name": "a", "type": "Node", "kept": "yes"}),
+            ("b", {"name": "b", "type": "Node"}),
+        ]
+    )
+    assert await graph.set_node_truth_state(
+        {"a": {"truth_alignment": ["x", "y"], "truth_epoch": 3}, "ghost": {"truth_alignment": []}}
+    ) == {"a": True, "ghost": False}
+    assert await graph.set_node_truth_state({"a": {"truth_alignment": ["z"]}}) == {"a": True}
+    state = await graph.get_node_truth_state(["a", "b", "ghost"])
+    assert state == {
+        "a": {"truth_alignment": ["z"], "truth_epoch": 3},
+        "b": {"truth_alignment": [], "truth_epoch": None},
+    }
+    assert (await graph.get_node("a"))["kept"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_truth_state_defaults_for_a_node_never_set(graph):
+    await graph.add_nodes([("a", {"name": "a", "type": "Node"})])
+    assert await graph.get_node_truth_state(["a"]) == {
+        "a": {"truth_alignment": [], "truth_epoch": None}
+    }
+
+
+@pytest.mark.asyncio
+async def test_update_node_merges_values_and_keeps_other_fields(graph):
+    await graph.add_nodes([("a", {"name": "a", "type": "Node", "keep": 1, "drop": 2})])
+    assert await graph.update_node("a", {"drop": 5, "added": "x"}) is True
+    node = await graph.get_node("a")
+    assert node["keep"] == 1
+    assert node["drop"] == 5
+    assert node["added"] == "x"
+    assert node["name"] == "a" and node["type"] == "Node"
+
+
+@pytest.mark.asyncio
+async def test_update_node_reports_missing_node_and_empty_patch(graph):
+    await graph.add_nodes([("a", {"name": "a", "type": "Node"})])
+    assert await graph.update_node("ghost", {"x": 1}) is False
+    assert await graph.update_node("a", {}) is False
+    assert await graph.update_node("", {"x": 1}) is False
+    assert "x" not in await graph.get_node("a")
+
+
+@pytest.mark.asyncio
+async def test_update_chunk_index_moves_only_that_property(graph):
+    ref = make_source_ref_key(uuid4(), uuid4())
+    await graph.add_nodes(
+        [
+            ("c1", {"name": "c1", "type": "DocumentChunk", "chunk_index": 0, "text": "t"}),
+            ("c2", {"name": "c2", "type": "DocumentChunk", "chunk_index": 1, "text": "u"}),
+        ],
+        source_ref_key=ref,
+    )
+    await graph.update_chunk_index({"c2": 4, "ghost": 9})
+    c1, c2 = await graph.get_nodes(["c1", "c2"])
+    assert c1["chunk_index"] == 0
+    assert c2 == {"id": "c2", "name": "c2", "type": "DocumentChunk", "chunk_index": 4, "text": "u"}
+    assert (await graph.get_node_delete_data(["c2"]))["c2"].source_ref_keys == [ref]
+
+
+@pytest.mark.asyncio
+async def test_update_chunk_index_skips_a_blob_that_is_not_an_object(graph):
+    """Ladybug skips a stored blob it cannot parse; rewriting it would erase its contents."""
+    from cognee_nanograph.tables import NODE_INDEXES, NODE_SCHEMA, NODES_TABLE
+
+    graph._t_merge(
+        NODES_TABLE,
+        "id",
+        NODE_SCHEMA,
+        [{"id": "bad", "name": "bad", "type": "Node", "properties": "not json"}],
+        NODE_INDEXES,
+    )
+    await graph.update_chunk_index({"bad": 2})
+    stored = graph._open(NODES_TABLE).to_table(columns=["properties"], filter="id = 'bad'")
+    assert stored.to_pylist() == [{"properties": "not json"}]
