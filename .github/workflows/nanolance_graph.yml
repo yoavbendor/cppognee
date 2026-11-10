@@ -1,0 +1,107 @@
+name: nanolance graph
+
+# The nanolance graph adapter (cognee_nanograph): its unit and Ladybug-parity tests, and the
+# product journeys in mock-LLM mode with GRAPH_DATABASE_PROVIDER=nanolance, once with access
+# control on (per-dataset graphs, no GRAPH_DATABASE_URL) and once off (one shared graph).
+# No LLM key is needed. nanolance is not a cognee dependency: it is built from source
+# (bindings/python, C++) from NANOLANCE_GIT_URL at NANOLANCE_REF.
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "cognee_nanograph/**"
+      - "cognee/tests/unit/graph_nanolance/**"
+      - "cognee/tests/journeys/**"
+      - "cognee/infrastructure/databases/graph/**"
+      - "cognee/infrastructure/databases/dataset_database_handler/**"
+      - "cognee/context_global_variables.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/nanolance_graph.yml"
+  push:
+    branches: [main]
+    paths:
+      - "cognee_nanograph/**"
+      - "cognee/tests/unit/graph_nanolance/**"
+      - "cognee/infrastructure/databases/graph/**"
+      - ".github/workflows/nanolance_graph.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: nanolance-graph-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NANOLANCE_GIT_URL: https://github.com/yoavbendor/nanolance
+  NANOLANCE_REF: main
+  # nanolance's build fetches nanom and nanos3reader, which are private: git takes a read-only
+  # token for those two URLs from the environment. Other URLs are untouched.
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.PRIVATE_REPOS_READ_TOKEN }}@github.com/yoavbendor/nanom.insteadOf
+  GIT_CONFIG_VALUE_0: https://github.com/yoavbendor/nanom
+  GIT_CONFIG_KEY_1: url.https://x-access-token:${{ secrets.PRIVATE_REPOS_READ_TOKEN }}@github.com/yoavbendor/nanos3reader.insteadOf
+  GIT_CONFIG_VALUE_1: https://github.com/yoavbendor/nanos3reader
+  # Mock-LLM journeys, as in journey_tests.yml: no provider is called; config validation wants these.
+  RUNTIME__LOG_LEVEL: ERROR
+  ENV: "dev"
+  TELEMETRY_DISABLED: "1"
+  COGNEE_JOURNEY_MODE: mock
+  LLM_PROVIDER: openai
+  LLM_MODEL: openai/gpt-5-mini
+  LLM_API_KEY: mock-key
+  EMBEDDING_PROVIDER: openai
+  EMBEDDING_MODEL: openai/text-embedding-3-small
+  EMBEDDING_DIMENSIONS: "256"
+  EMBEDDING_API_KEY: mock-key
+  COGNEE_SKIP_PREFLIGHT: "1"
+  COGNEE_SKIP_CONNECTION_TEST: "true"
+
+jobs:
+  nanolance-graph:
+    name: nanolance graph (unit, parity, journeys)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Cognee Setup
+        uses: ./.github/actions/cognee_setup
+        with:
+          python-version: "3.12.x"
+
+      - name: Build and install nanolance
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential
+          uv pip install --python .venv/bin/python \
+            "nanolance @ git+${NANOLANCE_GIT_URL}@${NANOLANCE_REF}#subdirectory=bindings/python"
+          .venv/bin/python -c "import nanolance, cognee_nanograph; print('nanolance', nanolance.__version__)"
+
+      # --no-sync everywhere below: a sync would remove nanolance, which the lockfile does not list.
+      - name: Adapter unit and Ladybug-parity tests
+        run: uv run --no-sync pytest cognee/tests/unit/graph_nanolance -v -p no:cacheprovider -W ignore
+
+      - name: Journeys on nanolance, access control on (per-dataset graphs, no URL)
+        env:
+          GRAPH_DATABASE_PROVIDER: nanolance
+        run: |
+          uv run --no-sync pytest -p cognee_nanograph.pytest_plugin cognee/tests/journeys \
+            -m "journey and not quickstart" -v --timeout=1500 -p no:cacheprovider -W ignore
+
+      - name: Journeys on nanolance, access control off (one shared graph)
+        env:
+          GRAPH_DATABASE_PROVIDER: nanolance
+          GRAPH_DATABASE_URL: ${{ runner.temp }}/nanolance-graph
+          ENABLE_BACKEND_ACCESS_CONTROL: "false"
+          REQUIRE_AUTHENTICATION: "false"
+        run: |
+          uv run --no-sync pytest -p cognee_nanograph.pytest_plugin \
+            cognee/tests/journeys/test_memory_correctness.py \
+            cognee/tests/journeys/test_data_lifecycle.py \
+            cognee/tests/journeys/test_idempotency_and_recovery.py \
+            cognee/tests/journeys/test_session_journey.py \
+            -v --timeout=1500 -p no:cacheprovider -W ignore
