@@ -19,6 +19,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -173,6 +174,9 @@ class _Guard:
         if _is_python(program) and _python_child_ok(argv):
             self.decide("exec", name, True)
             return
+        if name == "git" and (git_hosts(self.phase) or "git" in self.phase.subprocesses):
+            self.check_git_urls(argv)
+            return
         ok = name in self.phase.subprocesses or name in ALWAYS_ALLOWED_PROGRAMS
         self.decide(
             "exec",
@@ -180,6 +184,30 @@ class _Guard:
             ok,
             "" if ok else "executable not in subprocesses",
         )
+
+    def check_git_urls(self, argv: list[str]) -> None:
+        """git's own traffic is native, so check every repository URL on its command line: only
+        https (or file) URLs of hosts with role "git" may be used."""
+        for arg in argv[1:]:
+            scp = _SCP_URL.match(arg)
+            if scp:
+                self.decide("git", arg[:200], False, "ssh URLs are not allowed; use https")
+                return
+            m = _URL.match(arg)
+            if not m:
+                continue
+            u = urlsplit(arg)
+            if u.scheme == "file":
+                continue
+            host = u.hostname or ""
+            rule = self.phase.rule_for(_as_ip(host) or host)
+            if u.scheme != "https":
+                self.decide("git", arg[:200], False, "only https and file URLs are allowed")
+                return
+            if not (is_loopback(host) or (rule is not None and rule.role == "git")):
+                self.decide("git", f"{host}", False, "host is not listed with role 'git'")
+                return
+        self.decide("exec", " ".join(argv[:3])[:200], True)
 
     def on_http_send(self, args) -> None:
         conn, data = args[0], args[1]
@@ -364,23 +392,28 @@ HARDENED_ENV = {
     "GLINER_AUTO_INSTALL": "false",  # no pip/uv at runtime
     "ENOLA_NO_UPDATE_CHECK": "1",
 }
-RUNTIME_ONLY_ENV = {
-    "GIT_ALLOW_PROTOCOL": "file",  # git may read local repositories only; clones are an install step
-}
+_URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_SCP_URL = re.compile(r"^[\w.-]+@[\w.-]+:")
 
 
-def harden_environment(phase: str) -> None:
-    """Force HARDENED_ENV (and, at runtime, RUNTIME_ONLY_ENV) into os.environ."""
+def git_hosts(phase: Phase) -> tuple[HostRule, ...]:
+    """Host rules with role "git": the repositories git may use over https."""
+    return tuple(r for r in phase.hosts if r.role == "git")
+
+
+def harden_environment(policy: EgressPolicy, phase: str) -> None:
+    """Force HARDENED_ENV into os.environ. At runtime, git may use https only when the policy names
+    git hosts (role "git"); otherwise it may read local repositories only."""
     os.environ.update(HARDENED_ENV)
     if phase == "runtime":
-        os.environ.update(RUNTIME_ONLY_ENV)
+        os.environ["GIT_ALLOW_PROTOCOL"] = "file:https" if git_hosts(policy.runtime) else "file"
 
 
 def install(policy: EgressPolicy, phase: str = "runtime") -> None:
     """Install the guard for this process. A second call with the same policy and phase is a no-op
     apart from re-applying the hardened environment (a .env file may have been loaded meanwhile)."""
     global _guard
-    harden_environment(phase)
+    harden_environment(policy, phase)
     if _guard is not None:
         if (_guard.policy.path, _guard.phase_name) != (policy.path, phase):
             raise PolicyError(

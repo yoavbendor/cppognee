@@ -347,3 +347,45 @@ def test_hardened_environment_is_forced_and_reapplied(tmp_path):
             env_extra={"TELEMETRY_DISABLED": "", "GLINER_AUTO_INSTALL": "true"},
         )
     )
+
+
+GIT_POLICY = {
+    "mode": "enforce",
+    "runtime": {"hosts": [{"host": "gitlab.corp.example", "ports": [443], "role": "git"}]},
+}
+
+
+def test_git_over_https_to_git_hosts_only(tmp_path):
+    assert_ok(
+        run_child(
+            tmp_path,
+            """
+            import os
+            assert os.environ['GIT_ALLOW_PROTOCOL'] == 'file:https'
+            g = guard._guard
+            ok = lambda *a: g.on_process('/usr/bin/git', ['git', *a])
+            ok('clone', 'https://gitlab.corp.example/group/nanolance.git', '/tmp/x')
+            ok('-C', '/tmp/x', 'fetch', 'origin')
+            ok('clone', 'file:///srv/mirror/repo.git')
+            ok('--version')
+            assert denied(lambda: ok('clone', 'https://github.com/org/repo.git'))
+            assert denied(lambda: ok('clone', 'http://gitlab.corp.example/group/repo.git'))
+            assert denied(lambda: ok('clone', 'git@gitlab.corp.example:group/repo.git'))
+            assert denied(lambda: ok('clone', 'ssh://gitlab.corp.example/group/repo.git'))
+            """,
+            policy=GIT_POLICY,
+        )
+    )
+
+
+def test_without_git_hosts_git_is_local_only(tmp_path):
+    assert_ok(
+        run_child(
+            tmp_path,
+            """
+            import os
+            assert os.environ['GIT_ALLOW_PROTOCOL'] == 'file'
+            assert denied(lambda: guard._guard.on_process('git', ['git', 'status']))
+            """,
+        )
+    )

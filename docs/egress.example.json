@@ -7,7 +7,8 @@
       {"host": "llm.corp.example", "ports": [443], "role": "llm"},
       {"host": "embeddings.corp.example", "ports": [443], "role": "embedding"},
       {"host": "decider.corp.example", "ports": [443], "role": "decider"},
-      {"host": "artifactory.corp.example", "ports": [443], "role": "download", "download_only": true}
+      {"host": "artifactory.corp.example", "ports": [443], "role": "download", "download_only": true},
+      {"host": "gitlab.corp.example", "ports": [443], "role": "git"}
     ],
     "subprocesses": [],
     "listen": "loopback"
@@ -15,7 +16,7 @@
   "install": {
     "hosts": [
       {"host": "artifactory.corp.example", "ports": [443], "role": "download"},
-      {"host": "gitlab.corp.example", "ports": [443], "role": "download"},
+      {"host": "gitlab.corp.example", "ports": [443], "role": "git"},
       {"host": "extension.ladybugdb.com", "ports": [80, 443], "role": "download"}
     ],
     "subprocesses": ["git", "uv", "c++", "cmake", "ninja"]

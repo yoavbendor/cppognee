@@ -30,8 +30,9 @@ Variables, all optional: `DOCMEM_VENV` (venv path), `DOCMEM_PYTHON` (default 3.1
 
 ### On a corporate host: one egress policy for install and runtime
 
-Copy `docs/egress.example.json` (repository root), put your internal hosts in it (package mirror, git
-mirror, LLM, decider), and export it before setup and before every run:
+Copy `docs/egress.example.json` (repository root), put your internal hosts in it (package mirror, LLM,
+decider, and your GitLab with role `git` in both `install` and `runtime`, so git over https to it works
+during setup and at runtime), and export it before setup and before every run:
 
 ```sh
 export COGNEE_EGRESS_POLICY=$HOME/cognee-egress.json

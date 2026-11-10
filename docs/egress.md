@@ -37,8 +37,9 @@ Start from `docs/egress.example.json`:
 - `host`: an exact name, `.domain` for that domain and its subdomains, or an IP address. No
   wildcards or URLs. Loopback (`localhost`, `127.0.0.1`, `::1`) and Unix sockets are always allowed.
 - `role`: what the host is for. Configured endpoints must match: the LLM endpoint must be on an
-  `llm` host, embeddings on `embedding`, docmem's decider on `decider`. Other roles (`download`,
-  `auth`, `db`, `proxy`, ...) are free labels.
+  `llm` host, embeddings on `embedding`, docmem's decider on `decider`. A `git` host is a git
+  server (your GitLab): see "Git" below. Other roles (`download`, `auth`, `db`, `proxy`, ...) are
+  free labels.
 - `download_only`: only GET and HEAD to that host, checked for clients built on http.client
   (requests, urllib, urllib3). Under level 3 every connection is end-to-end TLS, which no proxy can
   look into without breaking it, so treat this as a second line: the first is to allow only mirrors
@@ -46,14 +47,15 @@ Start from `docs/egress.example.json`:
 - `subprocesses`: executable basenames cognee may start (for example `enola` for code graphs).
   `ldconfig` is always allowed: it only reads the local library cache (Python's `ctypes` uses it).
   Python children are allowed only for multiprocessing and cognee's own modules, which load the
-  guard again. A program you list here runs outside level 2: list networking programs (`git`,
-  `curl`, `uv`) only under level 3.
+  guard again. A program you list here runs outside level 2: list networking programs (`curl`,
+  `uv`) only under level 3. git has its own rule (below).
 - `listen`: `loopback` (default) refuses binding a server to any other address.
 - `mode`: `enforce` refuses; `record` allows everything and writes each decision to `log`. Use
   `record` once to learn what a workflow needs, then write the allowlist from the log.
 - `runtime` is what cognee runs with. `install` is used only by
   `python -m cognee_egress.isolate --phase install -- <setup command>`: this is how hosts such as
-  GitHub or GitLab are allowed while installing and never afterwards.
+  public GitHub are allowed while installing and never afterwards (your own git server, listed with
+  role `git` in both phases, stays available).
 
 ## What a policy also switches off
 
@@ -63,7 +65,27 @@ With a policy, these are forced on every start, after the `.env` file is loaded 
 `LITELLM_LOCAL_MODEL_COST_MAP=True` (no price list fetched from GitHub at import),
 `LITELLM_TELEMETRY=False`, `RUNTIME__DLTHUB_TELEMETRY=false`, `ANONYMIZED_TELEMETRY=False`,
 `GLINER_AUTO_INSTALL=false` (no pip at runtime), `ENOLA_NO_UPDATE_CHECK=1`, and at runtime
-`GIT_ALLOW_PROTOCOL=file` (git may read local repositories only).
+`GIT_ALLOW_PROTOCOL=file:https` when the policy has `git` hosts, else `GIT_ALLOW_PROTOCOL=file`.
+
+## Git
+
+List your git server (for example the corporate GitLab) with role `git`, in `runtime` and in
+`install`, and it is available in both phases over https:
+
+```json
+{"host": "gitlab.corp.example", "ports": [443], "role": "git"}
+```
+
+Then git may start without being listed in `subprocesses`, git itself refuses any transport but
+https and local files (`GIT_ALLOW_PROTOCOL`), and every repository URL on a git command line must be
+an https URL of a `git` host: `https://github.com/...`, `http://...` and ssh URLs
+(`git@host:group/repo.git`, `ssh://...`) are refused. git's own network traffic is native code, so
+at level 2 that URL check is the control; a fetch from an already cloned repository uses the URL
+checked when it was cloned. At level 3 the gateway also checks every connection git opens. Without
+`git` hosts, git may only read local repositories.
+
+Python code reaching the same host (for example the GitLab API) uses the same rule: a `git` host is
+an ordinary allowed host as well.
 
 A policy cannot be replaced or removed after it is installed in a process, by a `.env` file or by
 code, and an HTTP(S) proxy variable that points outside the machine is refused unless that proxy is
@@ -76,7 +98,7 @@ listed with role `proxy`, because a proxy hides the real destination from the gu
 | keyless embeddings (fastembed) and Hugging Face tokenizers | model download from huggingface.co is refused | point `HF_ENDPOINT` at a mirror listed with role `download`, or pre-download the models during install |
 | Ladybug JSON extension | its download (native code) is refused unless `extension.ladybugdb.com` is listed | install it during setup (`tools/work/setup.sh` does), or bundle the binaries |
 | URL ingestion, web scraping, Tavily | refused unless the site is listed | list the internal sites you ingest from |
-| code graphs | `enola` must be listed in `subprocesses`; git clones of URLs are refused at runtime | clone during install; ingest the local path |
+| code graphs | `enola` must be listed in `subprocesses`; git clones are allowed from `git` hosts only | list your GitLab with role `git` |
 | graph visualization page | the page loads d3 and fonts from public CDNs in your browser | not covered by this guard (it is your browser) |
 | API server | binds 0.0.0.0 by default, refused with `listen: loopback` | bind it to 127.0.0.1 |
 
