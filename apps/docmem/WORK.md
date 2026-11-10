@@ -39,6 +39,13 @@ NANOLANCE_GIT_URL=https://<your-gitlab>/<group>/nanolance bash apps/docmem/tools
 apps/docmem/.venv/bin/python -m cognee_egress.isolate -- bash apps/docmem/tools/work/run_eval.sh
 ```
 
+nanolance's C++ build clones five dependencies. Point them at your mirrors too, either all under one
+group with `NANOLANCE_GIT_BASE=https://<your-gitlab>/<group>` (each is then `<group>/<owner>/<repo>.git`),
+or one by one: `NANOLANCE_GIT_URL_NANOARROW` (apache/arrow-nanoarrow), `NANOLANCE_GIT_URL_ZSTD`
+(facebook/zstd), `NANOLANCE_GIT_URL_CLI11` (CLIUtils/CLI11), `NANOLANCE_GIT_URL_NANOM` (yoavbendor/nanom),
+`NANOLANCE_GIT_URL_NANOS3READER` (yoavbendor/nanos3reader). The build checks out pinned commits, so a
+mirror must carry full history, not a shallow copy.
+
 Setup then runs in a network namespace that can reach only the policy's `install` hosts; the evaluation
 runs where only the `runtime` hosts are reachable, so the decider host must be listed there with role
 `decider`. Without user namespaces (`unshare -rn true` fails), skip the `isolate` wrapper: the policy
