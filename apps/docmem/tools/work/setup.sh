@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Set up docmem from a fresh clone of cppognee: one venv with cognee (this repo), nanolance (built from source)
-# and docmem. Run from anywhere inside the clone:  bash apps/docmem/tools/work/setup.sh
-# Needs: git, uv (https://docs.astral.sh/uv/), a C++17 compiler, and network access to your package
-# index and to the nanolance git repository.
-# Variables (all optional): DOCMEM_VENV, DOCMEM_PYTHON (3.12), NANOLANCE_GIT_URL (the GitHub repo; set your
-# mirror's URL), NANOLANCE_REF (main), LADYBUG_EXTENSION_REPO (https://extension.ladybugdb.com/).
+# Set up docmem from a fresh clone of cppognee: one venv with cognee (this repo), nanolance and docmem.
+# Run from anywhere inside the clone:  bash apps/docmem/tools/work/setup.sh
+# Needs: git, uv (https://docs.astral.sh/uv/) and network access to your package index; to build nanolance
+# from source also a C++17 compiler and access to the nanolance git repository.
+# Variables (all optional): DOCMEM_VENV, DOCMEM_PYTHON (3.12), LADYBUG_EXTENSION_REPO
+# (https://extension.ladybugdb.com/), and where nanolance comes from, NANOLANCE_INSTALL:
+#   git (default)   build it from NANOLANCE_GIT_URL (the GitHub repo; set your mirror's URL) at NANOLANCE_REF (main)
+#   index           `nanolance` from your package index (an Artifactory that carries it)
+#   <path>.whl      that wheel file (a version your index does not carry yet)
 # With COGNEE_EGRESS_POLICY set, the whole setup runs isolated (no network except the policy's "install"
 # hosts, through cognee_egress.isolate); see docs/egress.md.
 set -euo pipefail
@@ -15,6 +18,16 @@ venv="${DOCMEM_VENV:-$docmem/.venv}"
 python="${DOCMEM_PYTHON:-3.12}"
 nanolance_url="${NANOLANCE_GIT_URL:-https://github.com/yoavbendor/nanolance}"
 nanolance_ref="${NANOLANCE_REF:-main}"
+nanolance_install="${NANOLANCE_INSTALL:-git}"
+case "$nanolance_install" in
+  git) nanolance_spec="nanolance @ git+${nanolance_url}@${nanolance_ref}#subdirectory=bindings/python"
+       nanolance_from="$nanolance_url@$nanolance_ref, bindings/python; builds C++" ;;
+  index) nanolance_spec="nanolance"; nanolance_from="your package index" ;;
+  *.whl) [ -f "$nanolance_install" ] || { echo "NANOLANCE_INSTALL: no wheel at $nanolance_install"; exit 1; }
+         nanolance_spec="$(cd "$(dirname "$nanolance_install")" && pwd)/$(basename "$nanolance_install")"
+         nanolance_from="wheel $nanolance_spec" ;;
+  *) echo "NANOLANCE_INSTALL must be git, index or a path to a .whl file, not '$nanolance_install'"; exit 1 ;;
+esac
 ladybug_repo="${LADYBUG_EXTENSION_REPO:-https://extension.ladybugdb.com/}"
 
 if [ -n "${COGNEE_EGRESS_POLICY:-}" ] && [ -z "${COGNEE_SETUP_ISOLATED:-}" ]; then
@@ -25,8 +38,10 @@ if [ -n "${COGNEE_EGRESS_POLICY:-}" ] && [ -z "${COGNEE_SETUP_ISOLATED:-}" ]; th
 fi
 
 command -v uv >/dev/null || { echo "uv is required: https://docs.astral.sh/uv/getting-started/installation/"; exit 1; }
-command -v c++ >/dev/null || command -v g++ >/dev/null || command -v clang++ >/dev/null || command -v cl >/dev/null \
-  || { echo "a C++17 compiler is required to build nanolance"; exit 1; }
+if [ "$nanolance_install" = git ]; then
+  command -v c++ >/dev/null || command -v g++ >/dev/null || command -v clang++ >/dev/null || command -v cl >/dev/null \
+    || { echo "a C++17 compiler is required to build nanolance (or set NANOLANCE_INSTALL=index or a .whl path)"; exit 1; }
+fi
 
 echo "== venv: $venv (Python $python)"
 uv venv --clear --python "$python" "$venv"
@@ -34,8 +49,8 @@ py="$venv/bin/python"; [ -x "$py" ] || py="$venv/Scripts/python.exe"
 
 echo "== cognee (this repository, editable)"
 uv pip install --python "$py" -e "$repo"
-echo "== nanolance ($nanolance_url@$nanolance_ref, bindings/python; builds C++)"
-uv pip install --python "$py" "nanolance @ git+${nanolance_url}@${nanolance_ref}#subdirectory=bindings/python"
+echo "== nanolance ($nanolance_from)"
+uv pip install --python "$py" "$nanolance_spec"
 echo "== docmem (editable)"
 uv pip install --python "$py" -e "$docmem"
 
