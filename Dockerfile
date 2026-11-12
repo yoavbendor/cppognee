@@ -69,6 +69,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Installing separately from its dependencies allows optimal layer caching
 COPY ./cognee /app/cognee
 COPY ./cognee_db_workers /app/cognee_db_workers
+# Listed in the wheel's packages (pyproject.toml), and imported by cognee/__init__.py
+# (egress guard) and cognee_db_workers, so the image needs them as well.
+COPY ./cognee_egress /app/cognee_egress
+COPY ./cognee_nanograph /app/cognee_nanograph
 # Bundle the JSON extension for both image arches; the loader picks the file
 # matching the installed ladybug version and runtime platform.
 COPY --from=ladybug-extensions /bundle/ /app/cognee_db_workers/ladybug_extensions/

@@ -17,6 +17,13 @@ The relevant workflows are `.github/workflows/release.yml` (tagged library relea
 `.github/workflows/dev_canary_release.yml` (weekly dev canaries), and
 `.github/workflows/release_mcp.yml` (manual MCP releases).
 
+> **Status as of 2026-11-12 (this fork).** The publishing workflows this page describes were
+> removed from this repository on that date: `dev_canary_release.yml`, `release_mcp.yml` and
+> the Docker Hub workflows (`dockerhub.yml`, `dockerhub-ui.yml`, `dockerhub-mcp.yml`). The
+> PyPI and Docker jobs in `release.yml` were removed too. So none of the PyPI, SLSA or Docker
+> attestations below are produced by this repository. The page is kept as the reference for
+> the upstream process and for verifying artifacts that upstream publishes.
+
 ---
 
 ## One-time setup: PyPI Trusted Publishing

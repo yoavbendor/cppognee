@@ -15,6 +15,8 @@ ladder — by-name load first (static builds), then this bundle, then the remote
 install as a last resort — lives in
 `cognee_db_workers/_kuzu_helpers.py::load_json_extension`.
 
+Under a `COGNEE_EGRESS_POLICY` the remote install is refused unless `extension.ladybugdb.com` is listed in the policy. Populate this folder (see *Populating* below) to run offline under a policy instead. See `docs/egress.md`.
+
 ## Layout
 
 Mirrors the extension repo, minus the trailing `json/` directory:

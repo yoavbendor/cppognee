@@ -38,6 +38,7 @@ concurrency:
 
 jobs:
   telemetry-insights:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     permissions:
       contents: read
       issues: write

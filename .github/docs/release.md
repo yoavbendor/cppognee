@@ -1,3 +1,13 @@
+> **Status as of 2026-11-12 (this fork).** Workflows in this repository no longer publish
+> outside GitHub, and no AI review, triage or summary service receives repository content.
+> Test suites still call LLM providers to test cognee's own integration. The Docker Hub
+> and PyPI publishing jobs and the Mintlify and community dispatches were removed from
+> `release.yml`, and the Docker Hub, dev-canary and MCP PyPI workflows were deleted. The
+> release notes are GitHub's generated notes; the AI-written notes step was removed. A
+> release now creates the tag and the GitHub release, and nothing else. The steps below
+> keep the upstream wording; the Docker Hub and PyPI checks in "Release validation" do not
+> apply to this fork.
+
 ## How to make a release
 
 ### Dev release
@@ -26,6 +36,8 @@
 
 ### Release validation
 
-1. Make sure that the correct image is published to [Docker Hub](https://hub.docker.com/r/cognee/cognee)
-2. Python package is published to [PyPi](https://pypi.org/project/cognee/)
-3. Find the created github release in [GitHub releases](https://github.com/topoteretes/cognee/releases). Edit/prettify the release notes if required.
+As of 2026-11-12 (this fork), only step 3 applies. Steps 1 and 2 describe upstream publishing that these workflows no longer perform.
+
+1. ~~Make sure that the correct image is published to Docker Hub~~ (not performed in this fork since 2026-11-12)
+2. ~~Python package is published to PyPI~~ (not performed in this fork since 2026-11-12)
+3. Find the created github release in [GitHub releases](https://github.com/topoteretes/cognee/releases). Edit the release notes if required; they are GitHub's generated notes.

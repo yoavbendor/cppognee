@@ -80,6 +80,18 @@
 | Give an existing agent memory | [Plugins and MCP](#connect-your-agent) |
 | Run Cognee on my infrastructure | [Deployment options](#deploy-cognee) |
 | Use a managed service | [Cognee Cloud](https://docs.cognee.ai/cognee-cloud/overview) |
+| Keep the graph in nanolance tables | [nanolance graph backend](#nanolance-graph-backend) |
+| Run under a corporate egress policy | [Egress control](#egress-control) |
+| Index a document folder by byte range | [docmem](apps/docmem/README.md) |
+
+## What this fork adds
+
+This repository is a fork of [topoteretes/cognee](https://github.com/topoteretes/cognee), based on 1.6.6. The sections below cover what it adds. The rest of this README describes upstream Cognee, which this fork does not change unless stated.
+
+- **nanolance graph backend** (`cognee_nanograph`): an alternative graph store in nanolance's Lance tables. Opt-in and Python only. See [nanolance graph backend](#nanolance-graph-backend).
+- **Egress control** (`cognee_egress`): one JSON policy that limits the hosts, ports and programs Cognee may use. See [Egress control](#egress-control).
+- **docmem** (`apps/docmem`): a document index that keeps vectors and byte-range pointers into the files, never the passage text. See [apps/docmem/README.md](apps/docmem/README.md).
+- **Core changes** these depend on: provider endpoints are checked against the egress policy at startup; a graph provider that is not built in uses the dataset handler of the same name; and a field marked `exclude=True` survives `copy_model`.
 
 ## Quickstart
 
@@ -90,6 +102,8 @@ Requires **Python 3.10–3.14**.
 ```bash
 uv pip install "cognee[gliner]"
 ```
+
+To run this fork's code instead of the PyPI release, install from a checkout of this repository: `uv pip install -e ".[gliner]"` in the repository root.
 
 ### Run locally without an LLM
 
@@ -274,6 +288,98 @@ docker compose --profile ui --profile mcp up
 The default ports are API **8000**, UI **3000**, and MCP **8001**. For deployment beyond a local demo, configure authentication, persistent storage, and compatible backends using the [permissions guide](https://docs.cognee.ai/setup-configuration/permissions) and [deployment templates](distributed/deploy/README.md). [Cognee Cloud](https://docs.cognee.ai/cognee-cloud/overview) provides the managed option.
 
 The `cognee/cognee` image ships with the GLiNER runtime baked in, so text ingestion and retrieval work in Docker without an LLM key; the local extraction and embedding models download on first use. Set `LLM_API_KEY` (as above) when you want generated answers.
+
+The `cognee/cognee` image is built from upstream Cognee and does not include this fork's changes.
+
+## nanolance graph backend
+
+nanolance is a private project. Its repository, `yoavbendor/nanolance`, is not public, so this backend can be installed only by someone with access to that repository. Ladybug is the default graph store and needs nothing from nanolance. Skip this section unless you have access.
+
+### What nanolance is
+
+nanolance is a storage library for tables in [Lance](https://lancedb.github.io/lance/) format, a columnar, versioned file format. Its core is C++17, with Python bindings in `bindings/python` (the `nanolance` package). The bindings include a `nanolance.lancedb` module, which serves cognee's vector store from nanolance. docmem uses that module; the graph backend does not need it.
+
+The build needs a C++17 compiler and three libraries, nanoarrow, zstd and CLI11, plus two private repositories, `nanom` and `nanos3reader`, which are fetched at pinned commits. Those private dependencies affect only building nanolance, not using the cognee adapter.
+
+### What the adapter stores
+
+`cognee_nanograph` implements cognee's graph interface on three tables in one directory:
+
+| table | rows | notes |
+|---|---|---|
+| `nodes` | one per graph node: `id`, `name`, `type`, timestamps, `properties` (JSON, zstd-compressed), provenance columns | BTREE index on `id`, BITMAP on `type` |
+| `edges` | one per edge: `source_id`, `target_id`, `relationship_name`, timestamps, `properties`, provenance columns, `edge_key` (`source\|relationship\|target`) | BTREE on `source_id`, `target_id`, `edge_key`; BITMAP on `relationship_name` |
+| `metadata` | key/value pairs, such as the provenance marker | |
+
+The provenance columns record which documents, dataset and pipeline runs own each node and edge. The adapter keeps them so that deletion can find the elements a document owns; the same columns exist in the Ladybug adapter.
+
+Writes are upserts. Learned values that `improve()` writes (feedback weights, truth state) are kept when an element is added again, as in the Ladybug adapter.
+
+### Concurrency
+
+- Within one process, writes are serialized by an asyncio lock.
+- Across processes on one machine, every write holds a file lock, `.write.lock`, in the graph directory. Each write re-reads the tables after taking the lock.
+- Reads take no lock. Each operation opens the tables at their current version, so processes sharing a directory see each other's writes.
+- Blocking Lance calls run in worker threads, so the event loop stays responsive.
+
+The file lock is local to the directory. This README makes no claim about directories on network filesystems.
+
+### What works, and what does not
+
+- **Supported:** the graph operations cognee uses for ingestion, retrieval, `improve()` and `forget()`. The adapter is checked against the Ladybug adapter by a parity test suite (`cognee/tests/unit/graph_nanolance/test_nanolance_parity.py`) and by product journeys in CI.
+- **Not supported: Cypher.** The adapter has no Cypher engine. Raw `query()` calls raise `NotImplementedError`, and so do the `CYPHER` and `NATURAL_LANGUAGE` search types. Ordinary `recall()` does not use Cypher unless `ALLOW_CYPHER_QUERY=true`, so it works; an explicit `CYPHER` search does not.
+- **Local directories only.** A remote key (`GRAPH_DATABASE_KEY`) is refused. Remote graph servers are not supported.
+- **Vectors are unchanged.** nanolance replaces only the graph. Vectors stay in the configured vector store, LanceDB by default.
+- **Existing data does not move.** A new graph directory starts empty. This README does not describe copying an existing Ladybug graph into nanolance.
+- **Not in the CLI or the Docker image.** Access is only through Python code that registers the backend, as shown below.
+
+### Setup
+
+1. Get access to `yoavbendor/nanolance` and check that `git ls-remote https://github.com/yoavbendor/nanolance` succeeds.
+2. Install nanolance. This builds C++ code, so it needs a C++17 compiler:
+
+   ```bash
+   uv pip install "nanolance @ git+https://github.com/yoavbendor/nanolance@main#subdirectory=bindings/python"
+   ```
+
+3. Register the backend before Cognee builds a graph engine, then select it:
+
+   ```python
+   import cognee_nanograph
+
+   cognee_nanograph.register()
+   ```
+
+   ```bash
+   export GRAPH_DATABASE_PROVIDER=nanolance
+   # Optional: the directory that holds the tables.
+   export GRAPH_DATABASE_URL=/absolute/path/to/graph_dir
+   ```
+
+4. Without `GRAPH_DATABASE_URL`, the graph lives at `<system root>/databases/cognee_graph_nanolance`. With backend access control on (the default), each user and dataset gets its own directory, `<system root>/databases/<owner id>/<dataset id>.nanolance`.
+
+`cognee-cli` and the API server do not call `register()`, so they cannot use this provider.
+
+### Tests
+
+- `pytest cognee/tests/unit/graph_nanolance` runs the adapter's unit, contract, parity and write-lock tests.
+- [`nanolance_graph.yml`](.github/workflows/nanolance_graph.yml) builds nanolance in CI, runs those tests, and runs the journey suites on the nanolance graph with access control on and off.
+
+## Egress control
+
+A host may need Cognee to reach only approved endpoints. A policy file lists the hosts, ports and programs Cognee may use, and everything else is refused. Start from [`docs/egress.example.json`](docs/egress.example.json), replace its hosts with yours, and set:
+
+```bash
+export COGNEE_EGRESS_POLICY=/absolute/path/to/egress-policy.json
+```
+
+The policy works at three levels, from lightest to strongest:
+
+1. **Endpoint check.** With a policy set, a configured LLM or embedding endpoint outside it fails at startup.
+2. **In-process guard.** Every Python-level DNS lookup, connection and subprocess start is checked, whichever library makes it.
+3. **Isolated runner.** `python -m cognee_egress.isolate --policy policy.json -- <command>` runs the command in a network namespace with only loopback. Its one way out is an allowlisting proxy, which also covers native code. This needs unprivileged user namespaces.
+
+Once a process has installed a policy, it cannot be replaced or removed, and the policy forces telemetry off. Some features need a decision for each deployment, such as the Ladybug JSON extension, URL ingestion and code graphs. [`docs/egress.md`](docs/egress.md) covers the policy format, those decisions and the limits of each level.
 
 ## Run the Whole Memory Layer on Postgres
 
