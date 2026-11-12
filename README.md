@@ -293,30 +293,77 @@ The `cognee/cognee` image is built from upstream Cognee and does not include thi
 
 ## nanolance graph backend
 
-nanolance stores Cognee's graph in two Lance tables, `nodes.lance` and `edges.lance`, instead of Ladybug. Ladybug remains the default. nanolance is not a Cognee dependency. Install it from its repository, which builds C++ code and so needs a C++17 compiler:
+nanolance is a private project. Its repository, `yoavbendor/nanolance`, is not public, so this backend can be installed only by someone with access to that repository. Ladybug is the default graph store and needs nothing from nanolance. Skip this section unless you have access.
 
-```bash
-uv pip install "nanolance @ git+https://github.com/yoavbendor/nanolance@main#subdirectory=bindings/python"
-```
+### What nanolance is
 
-Register the backend before Cognee builds a graph engine, then select it:
+nanolance is a storage library for tables in [Lance](https://lancedb.github.io/lance/) format, a columnar, versioned file format. Its core is C++17, with Python bindings in `bindings/python` (the `nanolance` package). The bindings include a `nanolance.lancedb` module, which serves cognee's vector store from nanolance. docmem uses that module; the graph backend does not need it.
 
-```python
-import cognee_nanograph
+The build needs a C++17 compiler and three libraries, nanoarrow, zstd and CLI11, plus two private repositories, `nanom` and `nanos3reader`, which are fetched at pinned commits. Those private dependencies affect only building nanolance, not using the cognee adapter.
 
-cognee_nanograph.register()
-```
+### What the adapter stores
 
-```bash
-export GRAPH_DATABASE_PROVIDER=nanolance
-# Optional: the directory that holds the two tables.
-export GRAPH_DATABASE_URL=/absolute/path/to/graph_dir
-```
+`cognee_nanograph` implements cognee's graph interface on three tables in one directory:
 
-- Without `GRAPH_DATABASE_URL`, the graph lives at `<system root>/databases/cognee_graph_nanolance`.
-- With backend access control on (the default), each user and dataset gets its own directory, `<system root>/databases/<owner id>/<dataset id>.nanolance`.
-- `cognee-cli` and the API server do not call `register()`, so they cannot use this provider. It is available only from Python code that registers it.
-- The CI workflow [`nanolance_graph.yml`](.github/workflows/nanolance_graph.yml) runs the adapter's unit and Ladybug-parity tests, and the journey suites on it, with access control on and off.
+| table | rows | notes |
+|---|---|---|
+| `nodes` | one per graph node: `id`, `name`, `type`, timestamps, `properties` (JSON, zstd-compressed), provenance columns | BTREE index on `id`, BITMAP on `type` |
+| `edges` | one per edge: `source_id`, `target_id`, `relationship_name`, timestamps, `properties`, provenance columns, `edge_key` (`source\|relationship\|target`) | BTREE on `source_id`, `target_id`, `edge_key`; BITMAP on `relationship_name` |
+| `metadata` | key/value pairs, such as the provenance marker | |
+
+The provenance columns record which documents, dataset and pipeline runs own each node and edge. The adapter keeps them so that deletion can find the elements a document owns; the same columns exist in the Ladybug adapter.
+
+Writes are upserts. Learned values that `improve()` writes (feedback weights, truth state) are kept when an element is added again, as in the Ladybug adapter.
+
+### Concurrency
+
+- Within one process, writes are serialized by an asyncio lock.
+- Across processes on one machine, every write holds a file lock, `.write.lock`, in the graph directory. Each write re-reads the tables after taking the lock.
+- Reads take no lock. Each operation opens the tables at their current version, so processes sharing a directory see each other's writes.
+- Blocking Lance calls run in worker threads, so the event loop stays responsive.
+
+The file lock is local to the directory. This README makes no claim about directories on network filesystems.
+
+### What works, and what does not
+
+- **Supported:** the graph operations cognee uses for ingestion, retrieval, `improve()` and `forget()`. The adapter is checked against the Ladybug adapter by a parity test suite (`cognee/tests/unit/graph_nanolance/test_nanolance_parity.py`) and by product journeys in CI.
+- **Not supported: Cypher.** The adapter has no Cypher engine. Raw `query()` calls raise `NotImplementedError`, and so do the `CYPHER` and `NATURAL_LANGUAGE` search types. Ordinary `recall()` does not use Cypher unless `ALLOW_CYPHER_QUERY=true`, so it works; an explicit `CYPHER` search does not.
+- **Local directories only.** A remote key (`GRAPH_DATABASE_KEY`) is refused. Remote graph servers are not supported.
+- **Vectors are unchanged.** nanolance replaces only the graph. Vectors stay in the configured vector store, LanceDB by default.
+- **Existing data does not move.** A new graph directory starts empty. This README does not describe copying an existing Ladybug graph into nanolance.
+- **Not in the CLI or the Docker image.** Access is only through Python code that registers the backend, as shown below.
+
+### Setup
+
+1. Get access to `yoavbendor/nanolance` and check that `git ls-remote https://github.com/yoavbendor/nanolance` succeeds.
+2. Install nanolance. This builds C++ code, so it needs a C++17 compiler:
+
+   ```bash
+   uv pip install "nanolance @ git+https://github.com/yoavbendor/nanolance@main#subdirectory=bindings/python"
+   ```
+
+3. Register the backend before Cognee builds a graph engine, then select it:
+
+   ```python
+   import cognee_nanograph
+
+   cognee_nanograph.register()
+   ```
+
+   ```bash
+   export GRAPH_DATABASE_PROVIDER=nanolance
+   # Optional: the directory that holds the tables.
+   export GRAPH_DATABASE_URL=/absolute/path/to/graph_dir
+   ```
+
+4. Without `GRAPH_DATABASE_URL`, the graph lives at `<system root>/databases/cognee_graph_nanolance`. With backend access control on (the default), each user and dataset gets its own directory, `<system root>/databases/<owner id>/<dataset id>.nanolance`.
+
+`cognee-cli` and the API server do not call `register()`, so they cannot use this provider.
+
+### Tests
+
+- `pytest cognee/tests/unit/graph_nanolance` runs the adapter's unit, contract, parity and write-lock tests.
+- [`nanolance_graph.yml`](.github/workflows/nanolance_graph.yml) builds nanolance in CI, runs those tests, and runs the journey suites on the nanolance graph with access control on and off.
 
 ## Egress control
 
