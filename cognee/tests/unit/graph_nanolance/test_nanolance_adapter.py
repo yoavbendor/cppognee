@@ -85,6 +85,29 @@ async def test_connections_and_edges_put_the_node_first(graph):
 
 
 @pytest.mark.asyncio
+async def test_node_edge_lookups_read_both_directions_with_quoted_ids(graph):
+    ids = ["o'brien", "b", "c", "d"]
+    await graph.add_nodes([(i, {"name": i, "type": "Node"}) for i in ids])
+    await graph.add_edges(
+        [
+            ("o'brien", "b", "knows", {}),
+            ("c", "o'brien", "knows", {}),
+            ("o'brien", "d", "cites", {}),
+            ("b", "c", "knows", {}),
+        ]
+    )
+    neighbours = await graph.get_neighbors("o'brien")
+    assert sorted(node["id"] for node in neighbours) == ["b", "c", "d"]
+    edges = await graph.get_edges("o'brien")
+    assert sorted(rel for _, rel, _ in edges) == ["cites", "knows", "knows"]
+    assert sorted(other["id"] for _, _, other in edges) == ["b", "c", "d"]
+    assert sorted(node["id"] for node in await graph.get_neighbors("b")) == ["c", "o'brien"]
+
+    nodes, _ = await graph.get_neighborhood(["o'brien"], depth=1, edge_types=["cites"])
+    assert sorted(node_id for node_id, _ in nodes) == ["d", "o'brien"]
+
+
+@pytest.mark.asyncio
 async def test_nodeset_subgraph_or_and_operators(graph):
     await graph.add_nodes(
         [(i, {"name": i, "type": "Person"}) for i in ["alice", "bob"]]
