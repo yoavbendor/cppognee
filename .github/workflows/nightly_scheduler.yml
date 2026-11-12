@@ -146,13 +146,3 @@ jobs:
           done
           echo "::error::no NEW Nightly Tests run appeared for ref $REF within 60s"
           exit 1
-
-      - name: Alert Slack if the dispatch failed
-        if: ${{ failure() }}
-        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d  # v4.0.0
-        with:
-          method: chat.postMessage
-          token: ${{ secrets.SLACK_NIGHTLY_BOT_TOKEN }}
-          payload: |
-            channel: ${{ secrets.SLACK_NIGHTLY_CHANNEL_ID }}
-            text: "Nightly Scheduler failed to dispatch Nightly Tests at `${{ steps.pick.outputs.ref }}` — tonight's nightly will not run and will post nothing. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

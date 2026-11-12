@@ -6,8 +6,8 @@ name: performance report (rust)
 # subcommand, and feeds it to the shared Python orchestrator
 # (cognee/tests/performance/statistics_percentile_report.py) via the BENCH_CMD
 # hook — so the identical percentile table + JSON + HTML report are produced and
-# uploaded to S3, and the headline metrics are exposed as outputs for the Slack
-# bot in nightly_tests.yml.
+# kept in the run, and the headline metrics are exposed as outputs for the caller.
+# Nothing is uploaded outside GitHub.
 #
 # Scope: file_based backend (SQLite + Ladybug + LanceDB), mock LLM only. The run
 # is fully offline — deterministic mock embeddings + a committed record/replay
@@ -52,9 +52,6 @@ on:
       metrics:
         description: "success + add/cognify/search/total p50/p90/p99."
         value: ${{ jobs.rust_file_based.outputs.metrics }}
-      html_key:
-        description: "S3 object key of the HTML report."
-        value: ${{ jobs.rust_file_based.outputs.html_key }}
 
 permissions:
   contents: read
@@ -92,7 +89,6 @@ jobs:
     timeout-minutes: 150
     outputs:
       metrics: ${{ steps.parse.outputs.metrics }}
-      html_key: ${{ steps.upload.outputs.html_key }}
     steps:
       # cognee (this repo) supplies the shared orchestrator + reporter.
       - name: Checkout cognee (orchestrator)
@@ -314,20 +310,6 @@ jobs:
                    workflow_git_sha: $workflow_sha}' \
              "$JSON_PATH" > "$tmp"
           mv "$tmp" "$JSON_PATH"
-
-      - name: Upload reports to S3
-        id: upload
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_DEV_USER_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_DEV_USER_SECRET_KEY }}
-          AWS_DEFAULT_REGION: eu-west-1
-        run: |
-          set -euo pipefail
-          aws s3 cp "$JSON_PATH" "s3://$BUCKET/$JSON_PATH" --content-type application/json
-          aws s3 cp "$HTML_PATH" "s3://$BUCKET/$HTML_PATH" --content-type text/html
-          # Presigning is done by the caller (the Slack job), NOT here — see the
-          # note in performance_report.yml. Pass only the (non-secret) object key.
-          echo "html_key=$HTML_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Parse headline metrics
         id: parse

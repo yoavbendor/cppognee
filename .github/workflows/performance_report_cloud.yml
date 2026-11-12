@@ -1,9 +1,9 @@
 name: performance report (cloud)
 
 # Reusable workflow: runs the percentile performance report against Cognee
-# Cloud (all processing server-side via cognee.serve()), uploads the JSON +
-# HTML artifacts to S3, and exposes the headline metrics + HTML object key as
-# outputs for the caller (the Slack bot in nightly_tests.yml).
+# Cloud (all processing server-side via cognee.serve()). The JSON + HTML reports
+# stay in the run, and the headline metrics are exposed as outputs for the caller.
+# Nothing is uploaded outside GitHub.
 #
 # Every benchmark run CREATES its own tenant through the tenant-controller
 # API, measures creation time as its own metric (tenant_create_time_s), runs
@@ -64,9 +64,6 @@ on:
       cloud_metrics:
         description: "Cloud run: success + add/cognify/search (GRAPH_COMPLETION + HYBRID_COMPLETION)/total p50/p90/p99."
         value: ${{ jobs.cloud.outputs.metrics }}
-      cloud_html_key:
-        description: "Cloud run: S3 object key of the HTML report."
-        value: ${{ jobs.cloud.outputs.html_key }}
 
 # Least-privilege token (OSSF Scorecard: Token-Permissions). The job only
 # checks out the repo; S3/cloud access uses dedicated secrets, not GITHUB_TOKEN.
@@ -90,7 +87,6 @@ jobs:
     timeout-minutes: 90
     outputs:
       metrics: ${{ steps.parse.outputs.metrics }}
-      html_key: ${{ steps.upload.outputs.html_key }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -181,22 +177,6 @@ jobs:
                    commit_timestamp: $commit_timestamp, git_repository: $repository}' \
              "$JSON_PATH" > "$tmp"
           mv "$tmp" "$JSON_PATH"
-
-      - name: Upload reports to S3
-        id: upload
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_DEV_USER_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_DEV_USER_SECRET_KEY }}
-          AWS_DEFAULT_REGION: eu-west-1
-        run: |
-          set -euo pipefail
-          aws s3 cp "$JSON_PATH" "s3://$BUCKET/$JSON_PATH" --content-type application/json
-          aws s3 cp "$HTML_PATH" "s3://$BUCKET/$HTML_PATH" --content-type text/html
-          # Presigning is done by the caller (the Slack job), NOT here: a presigned URL
-          # embeds the AWS access key id, and GitHub scrubs registered secrets from
-          # reusable-workflow outputs — which would blank the link. Pass only the
-          # (non-secret) object key across the boundary.
-          echo "html_key=$HTML_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Parse headline metrics
         id: parse

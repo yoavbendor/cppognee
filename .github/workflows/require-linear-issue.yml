@@ -36,7 +36,7 @@ jobs:
           KEYS='COG|SDK|CLO|COM|ENG|RES'
           if echo "$PR_TITLE $HEAD_REF" | grep -Eiq "\b(${KEYS})-[0-9]+\b"; then
             echo "Linear issue reference found."
-          # Automated release-pipeline PRs (release.yml's bump-mcp-lock sync PR)
+          # Automated release-pipeline PRs
           # have no ticket; they are marked with a "[release]" title suffix and
           # come from release/* branches.
           elif echo "$PR_TITLE" | grep -q "\[release\]" && echo "$HEAD_REF" | grep -q "^release/"; then

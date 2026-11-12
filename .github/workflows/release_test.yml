@@ -5,8 +5,7 @@ name: Release Test Workflow
 
 # Least-privilege token (OSSF Scorecard: Token-Permissions). packages: read is
 # needed because several jobs run a postgres service container pulled from
-# ghcr.io/topoteretes/pgvector:pg17 with the GITHUB_TOKEN. The dev-canary-release
-# job opts into the extra scopes its nested workflow requests explicitly.
+# ghcr.io/topoteretes/pgvector:pg17 with the GITHUB_TOKEN.
 permissions:
   contents: read
   packages: read
@@ -355,32 +354,6 @@ jobs:
     uses: ./.github/workflows/load_tests.yml
     secrets: inherit
 
-  dev-canary-release:
-    name: Dev Canary Release
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    needs: load-tests
-    # The nested release-pypi job requests id-token/attestations write for
-    # provenance publishing (#3298); a caller must grant at least that or
-    # GitHub rejects the WHOLE workflow at run creation (startup_failure on
-    # every dispatch since that change).
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-    uses: ./.github/workflows/dev_canary_release.yml
-    secrets: inherit
-
-  # ══ Large-scale migration compatibility (COG-6112) ═══════════════════════
-  # Codifies the 1.5.0 release validation: seed a production-shaped 2-dataset
-  # system on the pinned LEGACY cognee (mock-replay ingestion — zero AI calls),
-  # then run the current branch's full migration chain over it and verify the
-  # dataset-scoping fork split + rekey_fork_document_ids complete with data
-  # intact. Fixtures come from S3 (the perf-test war-and-peace corpus and its
-  # mock; swap in mock_war_and_peace_large.json + 80000/200000 floors for the
-  # 27x large-scale variant once it is uploaded).
-  #
-  # Matrix covers the core adapter pairs (Neo4j deliberately excluded for now).
   large-migration-compat:
     name: "Large migration compat (${{ matrix.scenario }}, v1.2.0 → current)"
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
