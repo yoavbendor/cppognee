@@ -23,6 +23,7 @@ env:
 
 jobs:
   prepare-merged-branches:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
@@ -81,9 +82,9 @@ jobs:
           python3 tools/prepare_merged_branches.py "${args[@]}"
 
   create-docs-prs:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     needs:
       - prepare-merged-branches
-    if: ${{ needs.prepare-merged-branches.outputs.has_merges == 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     strategy:
@@ -517,11 +518,11 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
   notify-failure:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     name: Notify failure
     needs:
       - prepare-merged-branches
       - create-docs-prs
-    if: ${{ failure() }}
     runs-on: ubuntu-22.04
     steps:
       - name: Check out repository

@@ -71,31 +71,14 @@ jobs:
           git tag "${TAG}"
           git push origin "${TAG}"
 
-      - name: Generate AI-powered release notes
-        id: generate_notes
-        env:
-          LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          LLM_ARGS: ${{ secrets.LLM_ARGS }}
-          LLM_MODEL: ${{ secrets.LLM_MODEL != '' && secrets.LLM_MODEL || 'openai/gpt-4o-mini' }}
-        run: |
-          # Set PYTHONPATH to include project root
-          export PYTHONPATH="${GITHUB_WORKSPACE}:${PYTHONPATH}"
-
-          # Generate release notes comparing the previous release tag to the new
-          # one. --base may be empty on a first-ever release; the script then
-          # auto-detects a base (excluding the tag being released).
-          uv run python tools/generate_release_notes.py \
-            --version "${{ steps.create_tag.outputs.version }}" \
-            --base "${{ steps.create_tag.outputs.prev_tag }}" \
-            --target "${{ steps.create_tag.outputs.tag }}" \
-            --github-output
-
-      - name: Create GitHub Release with AI-generated notes
+      # Release notes are GitHub's generated notes. An AI-written version would send the
+      # commit log to an analysis service, which was disabled on 2026-11-12.
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
         with:
           tag_name: ${{ steps.create_tag.outputs.tag }}
-          name: ${{ steps.generate_notes.outputs.RELEASE_TITLE }}
-          body: ${{ steps.generate_notes.outputs.RELEASE_NOTES }}
+          name: ${{ steps.create_tag.outputs.tag }}
+          generate_release_notes: true
           prerelease: ${{ github.ref_name == 'dev' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}

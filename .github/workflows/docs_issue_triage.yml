@@ -76,6 +76,7 @@ concurrency:
 
 jobs:
   triage:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     outputs:
@@ -170,8 +171,8 @@ jobs:
   # two issues never race on the docs repo. No uv here: everything this job runs
   # from tools/ is stdlib-only.
   draft-docs:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     needs: triage
-    if: ${{ (github.event_name == 'schedule' || github.event.inputs.dry_run != 'true') && needs.triage.outputs.has_gaps == 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:

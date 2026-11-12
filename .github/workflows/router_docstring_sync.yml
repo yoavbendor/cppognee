@@ -54,6 +54,7 @@ concurrency:
 
 jobs:
   sync-docstrings:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     permissions:
       contents: write
       pull-requests: write
@@ -205,6 +206,7 @@ jobs:
           fi
 
   describe-params:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     permissions:
       contents: write
       pull-requests: write
@@ -214,7 +216,6 @@ jobs:
     needs: sync-docstrings
     # Runs whenever the sync job pushed fresh fixes; also on manual dispatch,
     # to fill placeholders on an already-existing fix branch.
-    if: ${{ needs.sync-docstrings.outputs.changes_made == 'true' || github.event_name == 'workflow_dispatch' }}
 
     steps:
       # Dispatch runs may fire when no fix branch exists — degrade to a

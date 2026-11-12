@@ -391,9 +391,9 @@ jobs:
   # The rubric + Slack map live in the private cognee-ci repo; this job carries no review
   # logic. Runs only after the suite is green (needs: notify), core-team PRs only, advisory.
   claude-review:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     name: Claude Code Review
     needs: [ notify ]
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     continue-on-error: true
     permissions:

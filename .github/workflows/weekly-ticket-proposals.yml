@@ -27,6 +27,7 @@ permissions:
 
 jobs:
   digest:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -47,6 +48,7 @@ jobs:
           path: digest.md
 
   baseline:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     name: "Variant A: baseline (no cognee plugin)"
     needs: digest
     runs-on: ubuntu-latest
@@ -82,6 +84,7 @@ jobs:
             issue-baseline.md
 
   cognee-assisted:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     name: "Variant B: cognee plugin + indexed codebase"
     needs: digest
     runs-on: ubuntu-latest
@@ -144,6 +147,7 @@ jobs:
             issue-cognee.md
 
   publish:
+    if: ${{ false }}  # Disabled 2026-11-12: sends repository content to an AI analysis service.
     needs: [baseline, cognee-assisted]
     runs-on: ubuntu-latest
     steps:
