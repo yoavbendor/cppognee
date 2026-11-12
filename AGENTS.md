@@ -29,6 +29,9 @@ This document summarizes how to work with the cognee repository: how it’s orga
   - `__main__.py`: Entrypoint to route to CLI.
 - `cognee-mcp/`: Model Context Protocol server exposing cognee as MCP tools (SSE/HTTP/stdio). Contains its own README and Dockerfile.
 - `cognee-frontend/`: Next.js UI for local development and demos.
+- `cognee_egress/`: Egress policy and in-process guard (standard library only; `import cognee` loads it). See `docs/egress.md`.
+- `cognee_nanograph/`: nanolance graph adapter and dataset handler, registered from Python with `cognee_nanograph.register()`.
+- `apps/docmem/`: docmem, a document index on nanolance that stores byte ranges and vectors, never passage text.
 - `distributed/deploy/`: One-click deployment templates (Modal, Fly.io, Railway, Render, Daytona).
 - `examples/`: Example scripts demonstrating the public APIs and features (graph, code graph, multimodal, permissions, etc.).
 - `notebooks/`: Jupyter notebooks for demos and tutorials.
@@ -137,7 +140,9 @@ graph and vector databases. Backend support (source of truth:
 `cognee/infrastructure/databases/dataset_database_handler/supported_dataset_database_handlers.py`):
 
 - Graph — supported: Ladybug/Kuzu (default), Neo4j (needs multi-database, i.e.
-  Enterprise/Aura), Postgres (demo), Turso. Unsupported: Neptune, ladybug-remote.
+  Enterprise/Aura), Postgres (demo), Turso. Fork only: nanolance (`cognee_nanograph`,
+  registered with `cognee_nanograph.register()`; one directory per user+dataset).
+  Unsupported: Neptune, ladybug-remote.
 - Vector — supported: LanceDB (default), PGVector, Turso. Unsupported: Neptune
   Analytics and community adapters (unless they register a handler via
   `use_dataset_database_handler()`).
